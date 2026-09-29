@@ -1,0 +1,10 @@
+{
+  "name": "bcap",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Reusable browser automation CLI for the local Chromium: Playwright + raw CDP, script-file based.",
+  "dependencies": {
+    "playwright-core": "^1.63.0"
+  }
+}
