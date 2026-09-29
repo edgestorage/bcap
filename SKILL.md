@@ -54,10 +54,11 @@ echo '{"linkLimit":3}' | node scripts/bcap.mjs run sites/examples/read-page-summ
 
 Reusable script contract:
 
-- ESM `export default async function (input) { ... }`; globals: `page` (Playwright Page), `context`, `browser`, `cdp` (page CDP session), `cap` (`{ page, context, browser, cdp, goto, sleep }`), `input`.
+- ESM `export default async function (input) { ... }`; globals: `page` (Playwright Page), `context`, `browser`, `cdp` (page CDP session), `cap` (`{ page, context, browser, cdp, goto, click, type, press, sleep }`), `input`.
 - Return structured JSON (`{ ok, url, title, ... }`), not loose arrays or strings. Do not `console.log` — stdout carries the returned result.
 - Pass variable data through `--input '<json>'` / `--input-file <path>`; `--script-file -` and `--input-file -` read from stdin (stdin can only be consumed once — do not combine both).
 - Save reusable scripts to `sites/<domain>/<capability-name>.js` (domain = registrable domain, e.g. `github.com`, `docs.openai.com`).
+- Interact with `cap.click` / `cap.type` / `cap.press` (real input), not synthetic DOM events — see Real input below.
 
 Before writing a new script:
 
@@ -72,6 +73,20 @@ Tab selection for page commands: `--url <substr>` (reuse matching tab), `--tab <
 - `--evidence [sets]` records what happened during a `run`/`exec` and merges an `evidence` object into the result. Sets: `events` (navigation, console-error/warning, page-error, dialog, download, request-failed, new-tab), `dom` (visible-element diff with stable route keys, plus before/after timing), `common` (= events + dom), `all` (default when no value given). Use it to prove an action took effect and to debug flaky scripts. DOM lists default to 100 entries per list (`counts` and `omitted` are always exact; use `--evidence-limit all` for everything), and evidence briefly waits for the page to settle so async renders are captured.
 - `wait` blocks until a page condition is met instead of sleeping: `--until-selector <css>`, `--until-text <str>`, `--until-url <substr>`, `--url-change`; `--poll <ms>` (default 500), `--timeout <ms>` (default 120000). Exit code 1 on timeout.
 - `history [--limit N]` (default 20) lists recent executions with script, input, session, url/title, duration and error.
+
+## Real input (clicks, typing, keys)
+
+Drive the UI like a user: Playwright input is trusted by the page (`event.isTrusted === true`), while in-page `element.click()` / `dispatchEvent` is not and many sites ignore it (GitHub's file finder, for example). Prefer real input for anything that reacts to user gestures:
+
+```bash
+node scripts/bcap.mjs click 'button.submit'                          # real click
+node scripts/bcap.mjs type 'input[name=q]' 'hello world' --delay 40  # click, then real keystrokes
+node scripts/bcap.mjs type '#field' 'replace me' --clear             # clear the field first
+node scripts/bcap.mjs press Enter --selector 'input[name=q]'         # real key press on an element
+node scripts/bcap.mjs press 'Control+K'                              # key press on the focused element
+```
+
+Inside scripts use the same helpers on `cap` (`await cap.click(sel)`, `await cap.type(sel, text, { clear, delay })`, `await cap.press(key, { selector })`) or Playwright's own `page.getByRole(...).click()` / `page.keyboard.type(...)`. All three return `{ok, url, title, ...}` and accept `--timeout <ms>` for actionability waits.
 
 ## Token economy
 

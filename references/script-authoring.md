@@ -43,7 +43,7 @@ Maintain one `README.md` per domain directory:
   - `page` — Playwright `Page` (locators, clicks, typing, evaluate, waits, screenshots)
   - `context` / `browser` — Playwright `BrowserContext` / `Browser`
   - `cdp` — CDP session attached to the target page (`await cdp.send('Domain.method', params)`)
-  - `cap` — convenience helper `{ page, context, browser, cdp, goto(url, opts), sleep(ms) }`
+  - `cap` — convenience helpers `{ page, context, browser, cdp, goto(url, opts), click(selector, opts), type(selector, text, { clear, delay }), press(key, { selector }), sleep(ms) }`
   - `input` — same object as the function argument
 - Output: the returned value is printed as JSON to stdout. Return a structured object; do not `console.log` — stdout is the result.
 
@@ -97,6 +97,7 @@ Header requirements:
 
 - Drive variation through `input` with sane defaults and clamps (`Math.min(Math.max(limit, 1), 100)`); never hardcode one-off values in the file.
 - Wait for events, not time: `waitForLoadState`, `waitForSelector`, `locator.waitFor()`; expose timing in the result when it affects reliability.
+- Interact with real input (`cap.click` / `cap.type` / `cap.press` or Playwright locators). Synthetic DOM events (`element.click()`, `dispatchEvent`) are untrusted and get ignored by many frameworks; use them only for pure reads.
 - Filter hidden elements (computed style + bounding box) before extracting text/links.
 - Handle pagination explicitly; when you stop early, say so in the result (`pagesRead`, `truncated: true`).
 - Keep results stable for diffs: trim empty values, sort where order is not meaningful.

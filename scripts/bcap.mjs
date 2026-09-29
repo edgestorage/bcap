@@ -21,7 +21,7 @@ const HISTORY_FILE = path.join(SKILL_ROOT, '.state', 'history.jsonl');
 const HISTORY_MAX_BYTES = 2_000_000;
 const HISTORY_KEEP_LINES = 500;
 
-const VALUE_FLAGS = new Set(['cdp', 'api', 'session', 'tab', 'url', 'input', 'input-file', 'params', 'nav', 'script', 'script-file', 'limit', 'timeout', 'until-selector', 'until-text', 'until-url', 'poll', 'domain', 'match', 'format', 'evidence-limit']);
+const VALUE_FLAGS = new Set(['cdp', 'api', 'session', 'tab', 'url', 'input', 'input-file', 'params', 'nav', 'script', 'script-file', 'limit', 'timeout', 'until-selector', 'until-text', 'until-url', 'poll', 'domain', 'match', 'selector', 'delay', 'format', 'evidence-limit']);
 const OPTIONAL_VALUE_FLAGS = new Set(['new', 'evidence']);
 
 let forceExit = false;
@@ -784,6 +784,22 @@ async function cmdRun(flags, positional) {
           await page.goto(url, { waitUntil: options.waitUntil ?? 'domcontentloaded' });
           return { ok: true, url: page.url(), title: await safeTitle(page) };
         },
+        async click(selector, options = {}) {
+          await page.locator(selector).first().click({ timeout: options.timeout ?? DEFAULT_TIMEOUT_MS });
+          return { ok: true, selector, url: page.url(), title: await safeTitle(page) };
+        },
+        async type(selector, text, options = {}) {
+          const locator = page.locator(selector).first();
+          await locator.click({ timeout: options.timeout ?? DEFAULT_TIMEOUT_MS });
+          if (options.clear) await locator.fill('', { timeout: options.timeout ?? DEFAULT_TIMEOUT_MS });
+          await page.keyboard.type(String(text), { delay: options.delay ?? 0 });
+          return { ok: true, selector, value: await locator.inputValue().catch(() => null), url: page.url(), title: await safeTitle(page) };
+        },
+        async press(key, options = {}) {
+          if (options.selector) await page.locator(options.selector).first().press(key, { timeout: options.timeout ?? DEFAULT_TIMEOUT_MS });
+          else await page.keyboard.press(key);
+          return { ok: true, key, url: page.url(), title: await safeTitle(page) };
+        },
         sleep
       };
       globalThis.page = page;
@@ -914,6 +930,79 @@ async function cmdEval(flags, positional) {
     const page = await selectPage(context, flags);
     const result = await page.evaluate(expression);
     print(result === undefined ? null : result);
+  });
+}
+
+async function withActionEvidence(context, page, flags, action) {
+  const evidence = await startEvidence(context, page, parseEvidenceOptions(flags), parseEvidenceLimit(flags));
+  let result;
+  let error = null;
+  try {
+    result = await action();
+  } catch (caught) {
+    error = caught;
+  }
+  const evidenceOutput = await evidence.stop().catch(() => null);
+  const url = page.url();
+  const title = await safeTitle(page);
+  if (error) {
+    const message = String(error?.message ?? error);
+    const output = { ok: false, error: message, url, title };
+    if (evidenceOutput) output.evidence = evidenceOutput;
+    print(output);
+    process.exitCode = 1;
+    return;
+  }
+  print(mergeEvidence(result, evidenceOutput));
+}
+
+async function cmdClick(flags, positional) {
+  const selector = positional.join(' ').trim();
+  if (!selector) throw new Error('usage: bcap click <selector> [--timeout ms] [--evidence sets]');
+  const timeoutMs = parseTimeout(flags);
+  await withBrowser(flags, async ({ context }) => {
+    const page = await selectPage(context, flags);
+    await withActionEvidence(context, page, flags, async () => {
+      const locator = page.locator(selector).first();
+      await locator.click({ timeout: timeoutMs });
+      const text = ((await locator.textContent().catch(() => '')) || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+      return { ok: true, selector, clickedText: text, url: page.url(), title: await safeTitle(page) };
+    });
+  });
+}
+
+async function cmdType(flags, positional) {
+  if (positional.length < 2) throw new Error('usage: bcap type <selector> <text> [--delay ms] [--clear] [--timeout ms] [--evidence sets]');
+  const selector = positional[0];
+  const text = positional.slice(1).join(' ');
+  const timeoutMs = parseTimeout(flags);
+  const delay = flags.delay === undefined ? 0 : Number(flags.delay);
+  if (!Number.isFinite(delay) || delay < 0) throw new Error('--delay must be a non-negative number of milliseconds');
+  const clear = Boolean(flags.clear);
+  await withBrowser(flags, async ({ context }) => {
+    const page = await selectPage(context, flags);
+    await withActionEvidence(context, page, flags, async () => {
+      const locator = page.locator(selector).first();
+      await locator.click({ timeout: timeoutMs });
+      if (clear) await locator.fill('', { timeout: timeoutMs });
+      await page.keyboard.type(text, { delay });
+      const value = await locator.inputValue().catch(() => null);
+      return { ok: true, selector, typedChars: text.length, value, url: page.url(), title: await safeTitle(page) };
+    });
+  });
+}
+
+async function cmdPress(flags, positional) {
+  const key = positional.join(' ').trim();
+  if (!key) throw new Error('usage: bcap press <key> [--selector <css>] [--timeout ms] [--evidence sets]');
+  const timeoutMs = parseTimeout(flags);
+  await withBrowser(flags, async ({ context }) => {
+    const page = await selectPage(context, flags);
+    await withActionEvidence(context, page, flags, async () => {
+      if (flags.selector) await page.locator(String(flags.selector)).first().press(key, { timeout: timeoutMs });
+      else await page.keyboard.press(key);
+      return { ok: true, key, selector: flags.selector ? String(flags.selector) : null, url: page.url(), title: await safeTitle(page) };
+    });
   });
 }
 
@@ -1079,6 +1168,9 @@ Commands:
                          --script-file <path|-> also works; "-" reads the script from stdin
   exec --script "<js>"   Run a one-off in-page DOM script (or --script-file <file|->)
   eval "<expression>"    Evaluate one expression in the page and print the result
+  click <selector>       Real Playwright click on the selected tab
+  type <selector> <text> Real click, then type with real keyboard events (--clear, --delay ms)
+  press <key>            Real key press, e.g. Enter/Tab/Control+K (--selector to focus first)
   wait                   Wait for a page condition (see Wait options)
   history                Show recent run/exec executions (--limit N, default 20)
   nav <url>              Navigate the selected tab
@@ -1098,6 +1190,13 @@ Run/exec options:
   --timeout <ms>       Give up after <ms> (default 30000, max 120000)
   --evidence [sets]    Record execution evidence: events, dom, common, all (default all)
   --evidence-limit <n|all>  Max DOM entries per list (default 100; counts and omitted are always exact)
+
+Real input (click/type/press):
+  --timeout <ms>       Actionability timeout (default 30000, max 120000)
+  --delay <ms>         Keystroke delay for type (default 0)
+  --clear              Clear the field before typing
+  --selector <css>     Element to focus before press (also supports --url/--tab/--new/--nav)
+  --evidence [sets]    Record evidence around the action (events, dom, common, all)
 
 Wait options:
   --until-selector <css>   Wait until a matching element exists
@@ -1139,6 +1238,9 @@ async function main() {
     case 'stop': await cmdStop(flags, positional); return;
     case 'list': await cmdList(flags); return;
     case 'scripts': await cmdScripts(flags); return;
+    case 'click': await cmdClick(flags, positional); return;
+    case 'type': await cmdType(flags, positional); return;
+    case 'press': await cmdPress(flags, positional); return;
     case 'wait': await cmdWait(flags); return;
     case 'history': await cmdHistory(flags); return;
     case 'run': await cmdRun(flags, positional); return;
