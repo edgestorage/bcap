@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bcap"
+  short_description: "Playwright + CDP browser automation with reusable Node scripts"
+  default_prompt: "Use $bcap to drive the local Chromium and run reusable Node browser scripts."

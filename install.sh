@@ -12,6 +12,6 @@ if [ "${1:-}" = "--symlink" ]; then
 fi
 rm -rf "$target"
 mkdir -p "$target"
-cp -R "$skill_dir/SKILL.md" "$skill_dir/scripts" "$skill_dir/sites" "$skill_dir/package.json" "$target/"
+cp -R "$skill_dir/SKILL.md" "$skill_dir/README.md" "$skill_dir/scripts" "$skill_dir/sites" "$skill_dir/references" "$skill_dir/agents" "$skill_dir/package.json" "$target/"
 (cd "$target" && npm install --omit=dev --no-audit --no-fund >/dev/null)
 echo "bcap installed (copy) -> $target"

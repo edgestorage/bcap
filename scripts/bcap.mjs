@@ -14,8 +14,7 @@ const SKILL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '.
 const DEFAULT_API = process.env.BCAP_API || 'http://127.0.0.1:8080';
 const DEFAULT_CDP_CANDIDATES = [process.env.BCAP_CDP || 'http://127.0.0.1:9201'];
 const TAB_LIMIT = 20;
-
-const VALUE_FLAGS = new Set(['cdp', 'api', 'tab', 'url', 'input', 'input-file', 'params', 'nav', 'script', 'script-file', 'limit']);
+const VALUE_FLAGS = new Set(['cdp', 'api', 'session', 'tab', 'url', 'input', 'input-file', 'params', 'nav', 'script', 'script-file', 'limit']);
 const OPTIONAL_VALUE_FLAGS = new Set(['new']);
 
 function parseArgs(argv) {
@@ -79,23 +78,34 @@ async function probeCdp(endpoint) {
   }
 }
 
-async function managedChromium(api) {
+async function listManagedChromiums(api) {
   const state = await httpJson(`${api}/api/apps/sessions/state`);
-  const sessions = state?.data?.snapshot?.sessions ?? [];
-  const session = sessions.find((item) => item.appId === 'chromium' && item.status === 'running');
-  if (!session) return null;
-  if (session.automation?.endpoint) return { sessionId: session.id, endpoint: normalizeEndpoint(session.automation.endpoint) };
-  const automation = await httpJson(`${api}/api/apps/sessions/${session.id}/automation`).catch(() => null);
-  const endpoint = automation?.data?.endpoint || (automation?.data?.port ? `http://127.0.0.1:${automation.data.port}` : null);
-  return endpoint ? { sessionId: session.id, endpoint: normalizeEndpoint(endpoint) } : null;
+  const sessions = (state?.data?.snapshot?.sessions ?? []).filter((item) => item.appId === 'chromium' && item.status === 'running');
+  const result = [];
+  for (const session of sessions) {
+    let endpoint = session.automation?.endpoint ? normalizeEndpoint(session.automation.endpoint) : null;
+    if (!endpoint) {
+      const automation = await httpJson(`${api}/api/apps/sessions/${session.id}/automation`).catch(() => null);
+      const raw = automation?.data?.endpoint || (automation?.data?.port ? `http://127.0.0.1:${automation.data.port}` : null);
+      endpoint = raw ? normalizeEndpoint(raw) : null;
+    }
+    if (endpoint) result.push({ sessionId: session.id, endpoint, createdAt: String(session.createdAt ?? '') });
+  }
+  return result.sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
 }
 
 async function resolveEndpoint(flags) {
   const api = flags.api ? String(flags.api) : DEFAULT_API;
   if (flags.cdp) return normalizeEndpoint(flags.cdp);
+  const sessions = await listManagedChromiums(api).catch(() => []);
+  if (flags.session) {
+    const wanted = String(flags.session);
+    const hit = sessions.find((item) => item.sessionId === wanted);
+    if (!hit) throw new Error(`No running browser session with id ${wanted}. Run "status" to list sessions.`);
+    return hit.endpoint;
+  }
   if (process.env.BCAP_CDP) return normalizeEndpoint(process.env.BCAP_CDP);
-  const managed = await managedChromium(api).catch(() => null);
-  if (managed?.endpoint && (await probeCdp(managed.endpoint))) return managed.endpoint;
+  if (sessions.length && (await probeCdp(sessions[0].endpoint))) return sessions[0].endpoint;
   for (const candidate of DEFAULT_CDP_CANDIDATES) {
     if (candidate && (await probeCdp(candidate))) return normalizeEndpoint(candidate);
   }
@@ -160,10 +170,15 @@ async function selectPage(context, flags) {
   return items[0].page;
 }
 
+function readStdin() {
+  return fs.readFileSync(0, 'utf8');
+}
+
 function readInput(flags) {
   if (flags['input-file']) {
-    const file = path.resolve(process.cwd(), String(flags['input-file']));
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
+    const ref = String(flags['input-file']);
+    const text = ref === '-' ? readStdin() : fs.readFileSync(path.resolve(process.cwd(), ref), 'utf8');
+    return JSON.parse(text);
   }
   if (flags.input !== undefined) {
     if (flags.input === true) throw new Error('--input needs a JSON value, e.g. --input \'{"limit":10}\'');
@@ -174,9 +189,22 @@ function readInput(flags) {
 
 async function cmdStatus(flags) {
   const api = flags.api ? String(flags.api) : DEFAULT_API;
-  const managed = await managedChromium(api).catch(() => null);
-  let endpoint = flags.cdp ? normalizeEndpoint(flags.cdp) : (managed?.endpoint ?? null);
-  if (!endpoint) {
+  const sessions = await listManagedChromiums(api).catch(() => []);
+  let endpoint = null;
+  let selectedSessionId = null;
+  if (flags.cdp) {
+    endpoint = normalizeEndpoint(flags.cdp);
+  } else if (flags.session) {
+    const hit = sessions.find((item) => item.sessionId === String(flags.session));
+    if (!hit) throw new Error(`No running browser session with id ${flags.session}.`);
+    endpoint = hit.endpoint;
+    selectedSessionId = hit.sessionId;
+  } else if (process.env.BCAP_CDP) {
+    endpoint = normalizeEndpoint(process.env.BCAP_CDP);
+  } else if (sessions.length) {
+    endpoint = sessions[0].endpoint;
+    selectedSessionId = sessions[0].sessionId;
+  } else {
     for (const candidate of DEFAULT_CDP_CANDIDATES) {
       if (candidate && (await probeCdp(candidate))) { endpoint = normalizeEndpoint(candidate); break; }
     }
@@ -191,8 +219,9 @@ async function cmdStatus(flags) {
   print({
     ok: true,
     endpoint,
+    sessionId: selectedSessionId,
+    sessions: sessions.map((item) => ({ sessionId: item.sessionId, endpoint: item.endpoint, default: item.sessionId === selectedSessionId })),
     browser: version.Browser,
-    managedSessionId: managed?.sessionId ?? null,
     tabCount: tabs.length,
     tabs
   });
@@ -200,7 +229,7 @@ async function cmdStatus(flags) {
 
 async function cmdLaunch(flags) {
   const api = flags.api ? String(flags.api) : DEFAULT_API;
-  let session = await managedChromium(api).catch(() => null);
+  let session = flags['new-session'] ? null : ((await listManagedChromiums(api).catch(() => []))[0] ?? null);
   if (!session) {
     const response = await fetch(`${api}/api/apps/sessions`, {
       method: 'POST',
@@ -224,6 +253,16 @@ async function cmdLaunch(flags) {
   print({ ok: true, sessionId: session.sessionId, endpoint: session.endpoint, browser: version.Browser });
 }
 
+async function cmdStop(flags, positional) {
+  const sessionId = positional[0] ?? (flags.session ? String(flags.session) : null);
+  if (!sessionId) throw new Error('usage: bcap stop <sessionId> (or --session <id>)');
+  const api = flags.api ? String(flags.api) : DEFAULT_API;
+  const response = await fetch(`${api}/api/apps/sessions/${sessionId}/stop`, { method: 'POST', signal: AbortSignal.timeout(15000) });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(body?.error?.message || `stop failed (HTTP ${response.status})`);
+  print({ ok: true, sessionId, status: body?.data?.status ?? 'stopping' });
+}
+
 async function cmdList(flags) {
   const endpoint = await resolveEndpoint(flags);
   const tabs = (await httpJson(`${endpoint}/json/list`))
@@ -243,10 +282,18 @@ async function withBrowser(flags, handler) {
 }
 
 async function cmdRun(flags, positional) {
-  const file = positional[0];
-  if (!file) throw new Error("usage: bcap run <script-file> [--input JSON] [--tab id | --url substr | --new [url]] [--nav url]");
-  const abs = path.resolve(process.cwd(), file);
-  if (!fs.existsSync(abs)) throw new Error(`script file not found: ${abs}`);
+  let file = positional[0] ?? null;
+  let stdinSource = null;
+  if (!file && flags['script-file'] !== undefined) {
+    if (flags['script-file'] === true) throw new Error('--script-file needs a path or "-"');
+    const ref = String(flags['script-file']);
+    if (ref === '-') stdinSource = readStdin();
+    else file = ref;
+  }
+  if (!file && stdinSource === null) throw new Error("usage: bcap run <script-file> [--input JSON] [--tab id | --url substr | --new [url]] [--nav url]");
+  if (stdinSource !== null && flags['input-file'] === '-') throw new Error('stdin can only be consumed once; do not combine --script-file - with --input-file -');
+  const abs = file ? path.resolve(process.cwd(), file) : null;
+  if (abs && !fs.existsSync(abs)) throw new Error(`script file not found: ${abs}`);
   const input = readInput(flags);
   await withBrowser(flags, async ({ browser, context }) => {
     const page = await selectPage(context, flags);
@@ -270,7 +317,10 @@ async function cmdRun(flags, positional) {
     globalThis.cap = cap;
     globalThis.input = input;
     try {
-      const module = await import(`${pathToFileURL(abs).href}?t=${Date.now()}`);
+      const moduleUrl = stdinSource !== null
+        ? `data:text/javascript;base64,${Buffer.from(stdinSource).toString('base64')}`
+        : `${pathToFileURL(abs).href}?t=${Date.now()}`;
+      const module = await import(moduleUrl);
       const fn = module.default ?? module.run;
       if (typeof fn !== 'function') throw new Error('script must export default async function (input) {...}');
       const result = await fn(input);
@@ -294,9 +344,15 @@ function buildPageExpression(source, input) {
 
 async function cmdExec(flags) {
   let source = null;
-  if (flags['script-file']) source = fs.readFileSync(path.resolve(process.cwd(), String(flags['script-file'])), 'utf8');
-  else if (flags.script !== undefined && flags.script !== true) source = String(flags.script);
-  if (source === null) throw new Error('usage: bcap exec --script "<js>" | --script-file <file>');
+  if (flags['script-file'] !== undefined) {
+    if (flags['script-file'] === true) throw new Error('--script-file needs a path or "-"');
+    const ref = String(flags['script-file']);
+    source = ref === '-' ? readStdin() : fs.readFileSync(path.resolve(process.cwd(), ref), 'utf8');
+    if (ref === '-' && flags['input-file'] === '-') throw new Error('stdin can only be consumed once; do not combine --script-file - with --input-file -');
+  } else if (flags.script !== undefined && flags.script !== true) {
+    source = String(flags.script);
+  }
+  if (source === null) throw new Error('usage: bcap exec --script "<js>" | --script-file <file|->');
   const input = readInput(flags);
   await withBrowser(flags, async ({ context }) => {
     const page = await selectPage(context, flags);
@@ -384,11 +440,13 @@ function usage() {
 Usage: node scripts/bcap.mjs <command> [options]
 
 Commands:
-  status                 Show CDP endpoint, browser version and open tabs
-  launch                 Ensure the managed Chromium is running (starts it if needed)
+  status                 Show browser sessions, CDP endpoints and open tabs
+  launch                 Ensure a managed Chromium is running (--new-session to start another)
+  stop <sessionId>       Stop a managed browser session
   list                   List open page tabs
   run <script.js>        Run a reusable Node script (globals: page, context, browser, cdp, cap, input)
-  exec --script "<js>"   Run a one-off in-page DOM script (or --script-file <file>)
+                         --script-file <path|-> also works; "-" reads the script from stdin
+  exec --script "<js>"   Run a one-off in-page DOM script (or --script-file <file|->)
   eval "<expression>"    Evaluate one expression in the page and print the result
   nav <url>              Navigate the selected tab
   new [url]              Open a new tab
@@ -404,8 +462,9 @@ Tab selection (for page commands):
   --nav <url>      Navigate the selected tab before running
 
 Common options:
+  --session <id>   Target a specific managed browser session (see status; default: first running)
   --input JSON     Input object passed to the script (run/exec)
-  --input-file F   Read input JSON from a file
+  --input-file F   Read input JSON from a file ("-" reads stdin; cannot be combined with --script-file -)
   --cdp URL        Override the CDP endpoint (default: auto-discover, e.g. http://127.0.0.1:9201)
   --api URL        TaskHandoff API base (default: ${DEFAULT_API})
 `);
@@ -423,6 +482,7 @@ async function main() {
       return;
     case 'status': await cmdStatus(flags); return;
     case 'launch': await cmdLaunch(flags); return;
+    case 'stop': await cmdStop(flags, positional); return;
     case 'list': await cmdList(flags); return;
     case 'run': await cmdRun(flags, positional); return;
     case 'exec': await cmdExec(flags); return;
