@@ -2,6 +2,9 @@
  * bcap script — example (raw CDP usage)
  *
  * @description Collect page performance metrics through a raw CDP session.
+ * @type read
+ * @tags example, cdp, performance
+ * @match https://*, http://*
  * @param {object} input
  * @param {string[]} [input.names] Metric names to keep.
  * @returns {{ok: boolean, url: string, title: string, metrics: Record<string, number>}}

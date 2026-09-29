@@ -46,6 +46,8 @@ Choose the lightest form that fits the task:
 - Non-trivial or repeated work: a script file — this is the reusable capability path.
 
 ```bash
+node scripts/bcap.mjs scripts                                    # list the reusable script library
+node scripts/bcap.mjs scripts --domain github.com --match <url>  # filter by domain / by what can run there
 node scripts/bcap.mjs run sites/examples/read-page-summary.js --new https://example.com --input '{"linkLimit":5}'
 echo '{"linkLimit":3}' | node scripts/bcap.mjs run sites/examples/read-page-summary.js --url example.com --input-file -
 ```
@@ -59,10 +61,25 @@ Reusable script contract:
 
 Before writing a new script:
 
-1. Check `sites/<domain>/` for an existing script that already covers the need, and read that domain's `README.md` when present.
+1. Check the library first: `node scripts/bcap.mjs scripts --domain <domain>` (or `--match <url>`), then read `sites/<domain>/` and its `README.md` when present.
 2. Read `references/script-authoring.md` for the header format, naming, the domain README format, multi-page flows and worked examples.
 
 Tab selection for page commands: `--url <substr>` (reuse matching tab), `--tab <targetId>`, `--new [url]`, `--nav <url>` (navigate before acting); browser selection: `--session <id>`.
+
+## Execution controls
+
+- `--timeout <ms>` bounds `run` and `exec` (default 30000, max 120000). On expiry the CLI prints `{ok:false, timedOut:true, error:"... timed out after Xms", url, title}` and exits 1 immediately; page actions the script already dispatched may still settle, so re-check page state before retrying.
+- `--evidence [sets]` records what happened during a `run`/`exec` and merges an `evidence` object into the result. Sets: `events` (navigation, console-error/warning, page-error, dialog, download, request-failed, new-tab), `dom` (visible-element diff with stable route keys, plus before/after timing), `common` (= events + dom), `all` (default when no value given). Use it to prove an action took effect and to debug flaky scripts. DOM lists default to 100 entries per list (`counts` and `omitted` are always exact; use `--evidence-limit all` for everything), and evidence briefly waits for the page to settle so async renders are captured.
+- `wait` blocks until a page condition is met instead of sleeping: `--until-selector <css>`, `--until-text <str>`, `--until-url <substr>`, `--url-change`; `--poll <ms>` (default 500), `--timeout <ms>` (default 120000). Exit code 1 on timeout.
+- `history [--limit N]` (default 20) lists recent executions with script, input, session, url/title, duration and error.
+
+## Token economy
+
+stdout is compact single-line JSON by default; add `--pretty` (or `BCAP_FORMAT=pretty`) only when a human will read it. Keep results small:
+
+- Ask for less: `--limit` on `text`/`history`, `--evidence events` when DOM diffs are not needed, and `--evidence-limit <n|all>` for DOM lists (default 100 per list; `counts` are exact and `omitted` reports what was cut).
+- DOM evidence entries omit empty fields (`id`, `text`, `rect`), so large diffs stay cheap.
+- In scripts, return counts plus capped arrays (`itemCount`, `truncated`) instead of dumping full page text or HTML; never echo raw HTML.
 
 ## Playwright usage
 

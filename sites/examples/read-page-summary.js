@@ -2,6 +2,9 @@
  * bcap script — example
  *
  * @description Read a page summary: title, URL, headings, links and visible text.
+ * @type read
+ * @tags example, summary, extraction
+ * @match https://*, http://*
  * @param {object} input
  * @param {number} [input.headingLimit=10] Maximum number of headings to return.
  * @param {number} [input.linkLimit=20] Maximum number of links to return.

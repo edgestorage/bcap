@@ -56,6 +56,8 @@ Every saved script starts with a JSDoc-style metadata block:
  * bcap script
  *
  * @description Read a compact summary of the current page.
+ * @type read
+ * @tags summary, extraction
  * @param {object} input
  * @param {number} [input.limit=20] Optional maximum number of items to return.
  * @returns {{ok: boolean, url: string, title: string, items: Array<object>}}
@@ -66,11 +68,14 @@ export default async function (input) {
 }
 ```
 
+`bcap scripts` parses this block into the library index, so keep it machine-readable.
 
 Header requirements:
 
 - JSDoc syntax (`/** ... */`); first content line identifies the file as a `bcap script`.
 - `@description` — the reusable capability or workflow.
+- `@type` — `read` (page → data only) or `act` (changes page/site state); surfaced by `bcap scripts` so actions can be reviewed before running.
+- `@tags` — comma-separated keywords for searching the index.
 - `@param` — the input object and its important fields (defaults included).
 - `@returns` — when the structured result needs explanation.
 - `@match` — where the script can run, using full URL patterns with origin and path:
@@ -86,6 +91,7 @@ Header requirements:
 - On expected failures return `{ ok: false, error: 'message', url, title }`; throw only for programming errors.
 - Normalize page text before returning: collapse whitespace, trim, and cap length so results stay readable.
 - Make truncation visible: return counts (`itemCount`) or flags (`truncated: true`) when `input.limit` cut the data.
+- Keep results token-frugal: counts plus capped arrays beat full dumps; omit empty fields and never return raw HTML or whole-page text.
 
 ## Authoring checklist
 
@@ -193,7 +199,7 @@ If you do want explicit steps (resumable scripts, or driving by `input.step`), k
 ## Reuse workflow
 
 1. Explore: use `bcap exec` / `eval` for quick reads of the live page.
-2. Check: look in `sites/<domain>/` and its README for an existing script first.
+2. Check: query the index (`bcap scripts --domain <domain>`, `bcap scripts --match <url>`) and look in `sites/<domain>/` and its README for an existing script first.
 3. Codify: write `sites/<domain>/<capability-name>.js` with the header and conventions above.
 4. Run: `bcap run sites/<domain>/<capability-name>.js --input '{...}'` (target the right tab/browser with `--url`, `--tab`, `--session`).
 5. Iterate: fix selectors/waits and re-run until stable.

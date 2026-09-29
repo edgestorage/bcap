@@ -4,7 +4,9 @@
 
 - 自包含：`SKILL.md`（skill 定义）+ `scripts/bcap.mjs`（CLI）+ `sites/`（按站点沉淀的可复用脚本）
 - 连接任务实例内的受管 Chromium（自动发现 CDP 端点，通常为 `http://127.0.0.1:9201`），也可用 `--cdp` 指向任意已开调试端口的 Chromium
-- 脚本复用：脚本文件写一次，之后用 `--input` 反复执行
+- 脚本复用：脚本文件写一次，之后用 `--input` 反复执行；`scripts` 子命令按域名/匹配 URL 建立脚本索引
+- 执行控制：`--timeout` 超时、`--evidence` 执行证据（事件 + 可见元素 DOM diff）、`wait` 等待条件、`history` 执行历史
+- 省 token：输出默认单行紧凑 JSON（`--pretty` 美化）；evidence 每条列表默认最多 100 条（`counts`/`omitted` 始终精确，`--evidence-limit all` 可全量），DOM 条目自动省略空字段
 
 ## 安装
 
@@ -48,6 +50,10 @@ node scripts/bcap.mjs status   # 查看 CDP 端点、浏览器版本与标签页
 node scripts/bcap.mjs status     # 端点、浏览器版本、标签页
 node scripts/bcap.mjs launch     # 确保受管 Chromium 在运行
 node scripts/bcap.mjs run sites/examples/read-page-summary.js --new https://example.com --input '{"linkLimit":5}'
+node scripts/bcap.mjs scripts --match https://example.com/    # 脚本索引（--domain 过滤域名）
+node scripts/bcap.mjs exec --script "return { title: document.title }" --evidence all
+node scripts/bcap.mjs wait --until-selector '#ready' --timeout 60000
+node scripts/bcap.mjs history --limit 10
 node scripts/bcap.mjs cdp Browser.getVersion
 ```
 
@@ -58,7 +64,7 @@ node scripts/bcap.mjs cdp Browser.getVersion
 ```
 ├── SKILL.md                    # skill 定义（name/description + 使用指南）
 ├── references/                 # 脚本编写指南（reuse 规范、命名、域名 README、示例、旧脚本移植）
-├── scripts/bcap.mjs            # CLI 入口（status/launch/stop/run/exec/eval/nav/new/close/shot/text/cdp）
+├── scripts/bcap.mjs            # CLI 入口（status/launch/stop/scripts/run/exec/eval/wait/history/nav/new/close/shot/text/cdp）
 ├── sites/                      # 可复用站点脚本库（sites/<domain>/<capability-name>.js）
 │   └── examples/               # 示例脚本 + 域名 README 示例
 ├── agents/openai.yaml          # skill UI 元数据
