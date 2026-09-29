@@ -23,6 +23,16 @@ node scripts/bcap.mjs list
 node scripts/bcap.mjs text --url nodeseek.com
 ```
 
+## Browser lifecycle (TaskHandoff-managed)
+
+The browser is a managed app of the TaskHandoff instance — do not spawn a bare Chromium:
+
+- `launch` reuses a running `chromium` app session, or creates one via `POST /api/apps/sessions` (`appId: chromium`), waits until CDP is ready, and prints the endpoint. It is a no-op when a session is already running.
+- The managed session exposes CDP at `http://127.0.0.1:9201` and a KasmVNC view in the instance Web UI, so the user can watch and interact with the same tabs.
+- API base defaults to `http://127.0.0.1:8080`; override with `--api <url>` or `BCAP_API`. To drive a different Chromium (debugging port already open), use `--cdp <url>` or `BCAP_CDP`.
+- Tabs persist inside the session; it keeps running until stopped from the instance UI or `POST /api/apps/sessions/<id>/stop`.
+- If `status` reports no endpoint, run `launch` first — script/page commands fail fast with that hint otherwise.
+
 ## Reuse pattern (core capability)
 
 Write a script once under `sites/<domain>/<action>.js`, run it many times with different `--input`:

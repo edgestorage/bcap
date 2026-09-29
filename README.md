@@ -27,6 +27,20 @@ cd ~/.codex/skills/bcap && npm install
 - Node.js 18+（需要 `fetch` / `AbortSignal.timeout`）
 - `playwright-core`（`npm install` 安装，不下载浏览器）
 
+## 浏览器由 TaskHandoff 托管
+
+本 skill 面向 TaskHandoff 受管实例：浏览器是实例的受管 app（`appId=chromium`），不需要自己裸起 Chromium。
+
+```bash
+node scripts/bcap.mjs launch   # 复用运行中的会话；没有则创建并等待 CDP 就绪
+node scripts/bcap.mjs status   # 查看 CDP 端点、浏览器版本与标签页
+```
+
+- 等价的手工调用：`curl -X POST http://127.0.0.1:8080/api/apps/sessions -H 'Content-Type: application/json' -d '{"appId":"chromium"}'`
+- 会话同时提供 CDP（默认 `http://127.0.0.1:9201`）和实例 Web UI 中的 KasmVNC 可视窗口，用户可实时看到并操作同一个浏览器
+- API 地址默认 `http://127.0.0.1:8080`，用 `--api` / `BCAP_API` 覆盖；连接其它已开调试端口的 Chromium 用 `--cdp` / `BCAP_CDP`
+- 停止会话：实例 UI 或 `POST /api/apps/sessions/<id>/stop`
+
 ## 使用
 
 ```bash
