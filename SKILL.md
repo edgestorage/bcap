@@ -7,10 +7,10 @@ description: Operate the local Chromium browser through Playwright and raw CDP -
 
 Self-contained skill folder: `SKILL.md` + `scripts/bcap.mjs` (Node CLI, Playwright + raw CDP) + `sites/` (reusable scripts) + `references/` (authoring guide). It drives the TaskHandoff-managed Chromium; the CDP endpoint is auto-discovered (usually `http://127.0.0.1:9201`) and the VNC view is visible in the instance UI.
 
-All commands run from the skill folder:
+All commands run from the skill folder (the directory containing this `SKILL.md`; the development copy is `/workspace/bcap`):
 
 ```bash
-cd /workspace/bcap
+cd <skill-folder>   # e.g. ~/.codex/skills/bcap, ~/.config/opencode/skills/bcap or /workspace/bcap
 node scripts/bcap.mjs help
 ```
 

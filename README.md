@@ -14,11 +14,21 @@
 作为 Codex skill 安装：
 
 ```bash
-bash install.sh            # 拷贝到 ~/.codex/skills/bcap
-bash install.sh --symlink  # 或软链到本目录
+bash install.sh                     # 拷贝到 ~/.codex/skills/bcap
+bash install.sh --symlink           # 或软链到本目录
 ```
 
-或直接克隆到 skills 目录：
+作为 OpenCode skill 安装（OpenCode 原生支持 Agent Skills，读取 `~/.config/opencode/skills/<name>/SKILL.md`）：
+
+```bash
+bash install.sh --target opencode   # 拷贝到 ~/.config/opencode/skills/bcap
+bash install.sh --target all        # Codex 和 OpenCode 同时安装
+```
+
+> OpenCode 也会自动读取 `~/.claude/skills/<name>/SKILL.md` 与 `~/.agents/skills/<name>/SKILL.md` 兼容路径；这里安装到它的原生位置 `~/.config/opencode/skills`。
+> 两者都读取 SKILL.md 的 `name` / `description` frontmatter，`bcap` 的 frontmatter 同时满足 Codex 与 OpenCode 的规范。
+
+或直接克隆到 skills 目录（以 Codex 为例）：
 
 ```bash
 git clone <repo-url> ~/.codex/skills/bcap
@@ -72,6 +82,6 @@ node scripts/bcap.mjs cdp Browser.getVersion
 ├── sites/                      # 可复用站点脚本库（sites/<domain>/<capability-name>.js）
 │   └── examples/               # 示例脚本 + 域名 README 示例
 ├── agents/openai.yaml          # skill UI 元数据
-├── install.sh                  # 安装到 ~/.codex/skills/bcap
+├── install.sh                  # 安装到 Codex（~/.codex/skills/bcap）或 OpenCode（~/.config/opencode/skills/bcap）
 └── package.json
 ```
