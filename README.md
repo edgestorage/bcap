@@ -3,7 +3,7 @@
 一个 Codex skill：通过 Playwright 和原生 CDP 操作本机 Chromium 的浏览器自动化工具，全部用 Node 实现。
 
 - 自包含：`SKILL.md`（skill 定义）+ `scripts/bcap.mjs`（CLI）+ `sites/`（按站点沉淀的可复用脚本）
-- 连接任务实例内的受管 Chromium（自动发现 CDP 端点，通常为 `http://127.0.0.1:9201`），也可用 `--cdp` 指向任意已开调试端口的 Chromium
+- 自动判断环境：TaskHandoff 实例内驱动受管 Chromium（自动发现 CDP 端点，通常为 `http://127.0.0.1:9201`）；其他环境复用已开调试端口的 Chromium，或直接用本地 Chrome/Chromium 启动 `--remote-debugging-port`。也可用 `--cdp` 指向任意已开调试端口的 Chromium
 - 脚本复用：脚本文件写一次，之后用 `--input` 反复执行；`scripts` 子命令按域名/匹配 URL 建立脚本索引
 - 执行控制：`--timeout` 超时、`--evidence` 执行证据（事件 + 可见元素 DOM diff）、`wait` 等待条件、`history` 执行历史
 - 真实输入：`click` / `type` / `press` 走 Playwright 真实事件（`isTrusted=true`），脚本内可用 `cap.click` / `cap.type` / `cap.press`
@@ -40,26 +40,41 @@ cd ~/.codex/skills/bcap && npm install
 - Node.js 18+（需要 `fetch` / `AbortSignal.timeout`）
 - `playwright-core`（`npm install` 安装，不下载浏览器）
 
-## 浏览器由 TaskHandoff 托管
+## 运行环境与浏览器生命周期
 
-本 skill 面向 TaskHandoff 受管实例：浏览器是实例的受管 app（`appId=chromium`），不需要自己裸起 Chromium。
+bcap 自己判断运行环境（`status` 输出 `environment.mode` 与判断依据 `reason`）：
+
+- **TaskHandoff 实例**：检测到 `TASK_HANDOFF_*` 环境变量，或 `http://127.0.0.1:8080` 上的控制面可用。此时浏览器是实例的受管 app（`appId=chromium`），不需要自己裸起 Chromium。
+- **其他环境**（普通本机、其他 agent 运行时）：复用已开调试端口的 Chromium，或由 bcap 用本地 Chrome/Chromium 启动 `--remote-debugging-port`。
+
+默认 `auto`，可用 `--env taskhandoff|local` 或 `BCAP_ENV` 强制指定。
 
 ```bash
-node scripts/bcap.mjs launch   # 复用运行中的会话；没有则创建并等待 CDP 就绪
-node scripts/bcap.mjs status   # 查看 CDP 端点、浏览器版本与标签页
+node scripts/bcap.mjs status   # 环境、CDP 端点、浏览器版本、标签页、本地浏览器进程
+node scripts/bcap.mjs launch   # 幂等：可达就复用，没有才启动并等待 CDP 就绪
 ```
+
+任务实例模式：
 
 - 等价的手工调用：`curl -X POST http://127.0.0.1:8080/api/apps/sessions -H 'Content-Type: application/json' -d '{"appId":"chromium"}'`
 - 会话同时提供 CDP（默认 `http://127.0.0.1:9201`）和实例 Web UI 中的 KasmVNC 可视窗口，用户可实时看到并操作同一个浏览器
 - 支持同时运行多个浏览器会话：`status` 列出全部（默认目标带 default 标记），用 `--session <id>` 指定目标，`launch --new-session` 再开一个，`stop <id>` 停止指定会话
-- API 地址默认 `http://127.0.0.1:8080`，用 `--api` / `BCAP_API` 覆盖；连接其它已开调试端口的 Chromium 用 `--cdp` / `BCAP_CDP`
+- API 地址默认 `http://127.0.0.1:8080`，用 `--api` / `BCAP_API` 覆盖
 - 停止会话：实例 UI 或 `POST /api/apps/sessions/<id>/stop`
+
+其他环境（本地浏览器）：
+
+- `launch` 先复用可达的 CDP 端点（`--cdp` / `BCAP_CDP`，或默认端口 9201 / 9222），都没有才启动本地浏览器
+- 启动参数：默认**有界面**（非 headless，用户能看到并接管同一个窗口），只有显式 `--headless` 或 `BCAP_HEADLESS=1` 才无头启动（无显示器环境才需要）；另有 `--executable <path>`（或 `BCAP_BROWSER`）、`--user-data-dir <dir>`（默认 `<skill>/.state/browser-profile`，登录态可跨次复用）、`--port <n>`（起始端口，默认 9222，或 `BCAP_PORT`）、`--new-session` 再开一个而不是复用
+- 可执行文件查找顺序：`--executable` / `BCAP_BROWSER` → Chrome/Chromium/Edge/Brave/Vivaldi（macOS `/Applications`、Windows `Program Files`、Linux `PATH`）→ Playwright 自带 Chromium；都找不到时直接报错并提示设置路径
+- 启动的浏览器记录在 `<skill>/.state/local-browser.json`（gitignore），`status` 的 `localBrowsers` 会列出；`stop <id|pid|port>` 或 `stop all` 结束。进程已死或 CDP 不可达的记录自动清理，不会被复用
 
 ## 使用
 
 ```bash
-node scripts/bcap.mjs status     # 端点、浏览器版本、标签页
-node scripts/bcap.mjs launch     # 确保受管 Chromium 在运行
+node scripts/bcap.mjs status     # 环境、端点、浏览器版本、标签页
+node scripts/bcap.mjs launch     # 确保浏览器在运行（受管 Chromium 或本地 Chrome）
+node scripts/bcap.mjs launch --headless --executable '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 node scripts/bcap.mjs run sites/examples/read-page-summary.js --new https://example.com --input '{"linkLimit":5}'
 node scripts/bcap.mjs scripts --match https://example.com/    # 脚本索引（--domain 过滤域名）
 node scripts/bcap.mjs click 'input[name=q]'                     # 真实点击
@@ -83,5 +98,6 @@ node scripts/bcap.mjs cdp Browser.getVersion
 │   └── examples/               # 示例脚本 + 域名 README 示例
 ├── agents/openai.yaml          # skill UI 元数据
 ├── install.sh                  # 安装到 Codex（~/.codex/skills/bcap）或 OpenCode（~/.config/opencode/skills/bcap）
+├── .state/                     # 运行时状态（history.jsonl、local-browser.json、本地浏览器 profile；已 gitignore）
 └── package.json
 ```

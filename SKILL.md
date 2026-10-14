@@ -5,7 +5,12 @@ description: Operate the local Chromium browser through Playwright and raw CDP -
 
 # bcap — local browser capability
 
-Self-contained skill folder: `SKILL.md` + `scripts/bcap.mjs` (Node CLI, Playwright + raw CDP) + `sites/` (reusable scripts) + `references/` (authoring guide). It drives the TaskHandoff-managed Chromium; the CDP endpoint is auto-discovered (usually `http://127.0.0.1:9201`) and the VNC view is visible in the instance UI.
+Self-contained skill folder: `SKILL.md` + `scripts/bcap.mjs` (Node CLI, Playwright + raw CDP) + `sites/` (reusable scripts) + `references/` (authoring guide). It drives whichever Chromium is available and detects the environment itself:
+
+- **TaskHandoff instance** (`TASK_HANDOFF_*` markers or a control plane answering on `http://127.0.0.1:8080`): drives the managed Chromium session, CDP auto-discovered (usually `http://127.0.0.1:9201`); the VNC view is visible in the instance UI.
+- **Any other environment** (plain machine, other agent runtime): reuses a Chromium that already has a debugging port open (`BCAP_CDP`, 9201, 9222, …) or launches the local Chrome/Chromium itself with `--remote-debugging-port`.
+
+`status` reports the detected environment; `--env taskhandoff|local` (or `BCAP_ENV`) forces it when detection is wrong.
 
 All commands run from the skill folder (the directory containing this `SKILL.md`; the development copy is `/workspace/bcap`):
 
@@ -27,16 +32,27 @@ node scripts/bcap.mjs launch   # no session running: start one and wait for CDP
 - Multiple sessions running → target the matching one with `--session <id>`; do not guess when ambiguous — ask the user.
 - Target page not open → `nav` / `new`, or ask the user to open it.
 
-## Browser lifecycle (TaskHandoff-managed)
+## Browser lifecycle
 
-The browser is a managed app of the TaskHandoff instance — do not spawn a bare Chromium:
+`launch` is idempotent in both environments: it reuses a browser that is already reachable and only starts one when needed.
 
-- `launch` reuses a running `chromium` app session, or creates one via `POST /api/apps/sessions` (`appId: chromium`), waits until CDP is ready, and prints the endpoint. It is a no-op when a session is already running.
+**TaskHandoff instance** — the browser is a managed app of the instance, so bcap never spawns a bare Chromium:
+
+- `launch` reuses a running `chromium` app session, or creates one via `POST /api/apps/sessions` (`appId: chromium`), waits until CDP is ready, and prints the endpoint.
 - Multiple browsers can run at once. `status` lists all sessions (the first running one is the default target); add `--session <id>` to target another, `launch --new-session` to start an additional session, and `stop <sessionId>` to end one.
 - The managed session exposes CDP at `http://127.0.0.1:9201` and a KasmVNC view in the instance Web UI, so the user can watch and interact with the same tabs.
-- API base defaults to `http://127.0.0.1:8080`; override with `--api <url>` or `BCAP_API`. To drive a different Chromium (debugging port already open), use `--cdp <url>` or `BCAP_CDP`.
+- API base defaults to `http://127.0.0.1:8080`; override with `--api <url>` or `BCAP_API`.
 - Tabs persist inside the session; it keeps running until stopped from the instance UI or `POST /api/apps/sessions/<id>/stop`.
-- If `status` reports no endpoint, run `launch` first — script/page commands fail fast with that hint otherwise.
+
+**Other environments** — bcap starts the local browser itself:
+
+- `launch` reuses a reachable CDP endpoint first (a browser the user or another tool already started, `--cdp` / `BCAP_CDP`, or the default ports 9201 / 9222), then otherwise spawns the local Chrome/Chromium with `--remote-debugging-port` on a free port.
+- Launch options: `--headless` (or `BCAP_HEADLESS=1`) — opt-in only, the default is a visible browser window, so pass it only on machines without a display; plus `--executable <path>` (or `BCAP_BROWSER`), `--user-data-dir <dir>` (default `<skill>/.state/browser-profile`, so logins persist), `--port <n>` (first port to try, default 9222, or `BCAP_PORT`), and `--new-session` to start an extra browser instead of reusing one.
+- Executable discovery order: `--executable` / `BCAP_BROWSER` → Chrome/Chromium/Edge/Brave/Vivaldi (macOS `/Applications`, Windows `Program Files`, Linux `PATH`) → Playwright's bundled Chromium. Nothing found fails with the exact path to set.
+- Launched browsers are tracked in `<skill>/.state/local-browser.json`; `status` lists them under `localBrowsers`, and `stop <local-id|pid|port>` (or `stop all`) ends them. Stale entries — dead pid or unreachable CDP — are pruned, and a browser that died is never reused.
+- `--cdp <url>` still points any command at an arbitrary Chromium with an open debugging port, regardless of the detected environment.
+
+If `status` reports no endpoint, run `launch` first — script/page commands fail fast with that hint otherwise.
 
 ## Run scripts and reuse (core capability)
 

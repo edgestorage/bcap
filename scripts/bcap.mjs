@@ -2,17 +2,30 @@
 /**
  * bcap — browser capability CLI for the local Chromium.
  *
- * Talks to the TaskHandoff-managed Chromium over CDP. Provides reusable
- * script execution (Playwright API in Node), one-off in-page scripts, raw
- * CDP calls, tab management, screenshots and page reads.
+ * Talks to a Chromium over CDP. In a TaskHandoff instance it drives the
+ * managed Chromium session (control plane API on 127.0.0.1:8080); anywhere
+ * else it discovers an already-running debug port or launches the local
+ * Chrome/Chromium with --remote-debugging-port. Provides reusable script
+ * execution (Playwright API in Node), one-off in-page scripts, raw CDP
+ * calls, tab management, screenshots and page reads.
  */
 import fs from 'node:fs';
+import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const SKILL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DEFAULT_API = process.env.BCAP_API || 'http://127.0.0.1:8080';
-const DEFAULT_CDP_CANDIDATES = [process.env.BCAP_CDP || 'http://127.0.0.1:9201'];
+const TASK_HANDOFF_CDP = 'http://127.0.0.1:9201';
+const LOCAL_CDP_PORT = Number(process.env.BCAP_PORT) || 9222;
+const LOCAL_CDP = `http://127.0.0.1:${LOCAL_CDP_PORT}`;
+const CDP_CANDIDATES = [...new Set([process.env.BCAP_CDP || TASK_HANDOFF_CDP, LOCAL_CDP])].filter(Boolean);
+const LOCAL_BROWSER_STATE_FILE = path.join(SKILL_ROOT, '.state', 'local-browser.json');
+const LOCAL_PROFILE_DIR = process.env.BCAP_PROFILE_DIR || path.join(SKILL_ROOT, '.state', 'browser-profile');
+const API_PROBE_TIMEOUT_MS = 1500;
+const TASK_HANDOFF_ENV_KEYS = ['TASK_HANDOFF_DATA_DIR', 'TASK_HANDOFF_INSTANCE_ID', 'TASK_HANDOFF_INSTANCE_NAME', 'TASK_HANDOFF_NODE_AGENT_URL', 'TASK_HANDOFF_CONTROL_MODE', 'TASK_HANDOFF_AGENT_TOOLS_ENDPOINT'];
 const TAB_LIMIT = 20;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 120_000;
@@ -21,7 +34,7 @@ const HISTORY_FILE = path.join(SKILL_ROOT, '.state', 'history.jsonl');
 const HISTORY_MAX_BYTES = 2_000_000;
 const HISTORY_KEEP_LINES = 500;
 
-const VALUE_FLAGS = new Set(['cdp', 'api', 'session', 'tab', 'url', 'input', 'input-file', 'params', 'nav', 'script', 'script-file', 'limit', 'timeout', 'until-selector', 'until-text', 'until-url', 'poll', 'domain', 'match', 'selector', 'delay', 'format', 'evidence-limit']);
+const VALUE_FLAGS = new Set(['cdp', 'api', 'env', 'session', 'tab', 'url', 'input', 'input-file', 'params', 'nav', 'script', 'script-file', 'limit', 'timeout', 'until-selector', 'until-text', 'until-url', 'poll', 'domain', 'match', 'selector', 'delay', 'format', 'evidence-limit', 'port', 'executable', 'user-data-dir']);
 const OPTIONAL_VALUE_FLAGS = new Set(['new', 'evidence']);
 
 let forceExit = false;
@@ -90,9 +103,261 @@ async function probeCdp(endpoint) {
   }
 }
 
+// --- environment detection: TaskHandoff instance vs plain local machine ---
+
+let envOverride = (process.env.BCAP_ENV || 'auto').toLowerCase();
+const environmentCache = new Map();
+
+function taskHandoffHints() {
+  return TASK_HANDOFF_ENV_KEYS.filter((key) => process.env[key]);
+}
+
+async function controlPlaneSessions(api, timeoutMs = 15000) {
+  const base = normalizeEndpoint(api);
+  const state = await httpJson(`${base}/api/apps/sessions/state`, { signal: AbortSignal.timeout(timeoutMs) });
+  const sessions = state?.data?.snapshot?.sessions;
+  if (!Array.isArray(sessions)) throw new Error(`unexpected control plane response from ${base}`);
+  return sessions;
+}
+
+async function detectEnvironment(api = DEFAULT_API) {
+  if (envOverride === 'local') return { mode: 'local', reason: 'BCAP_ENV=local' };
+  if (envOverride === 'taskhandoff' || envOverride === 'th') return { mode: 'taskhandoff', reason: 'BCAP_ENV=taskhandoff' };
+  if (envOverride !== 'auto') throw new Error(`environment must be "auto", "taskhandoff" or "local" (got "${envOverride}")`);
+  const base = normalizeEndpoint(api);
+  const cached = environmentCache.get(base);
+  if (cached) return cached;
+  const hints = taskHandoffHints();
+  let result;
+  if (hints.length) {
+    result = { mode: 'taskhandoff', reason: `task handoff env (${hints[0]})`, api: base };
+  } else {
+    const reachable = await controlPlaneSessions(base, API_PROBE_TIMEOUT_MS).then(() => true).catch(() => false);
+    result = reachable
+      ? { mode: 'taskhandoff', reason: `task handoff control plane at ${base}`, api: base }
+      : { mode: 'local', reason: `no task handoff markers and no control plane at ${base}`, api: base };
+  }
+  environmentCache.set(base, result);
+  return result;
+}
+
+// --- locally launched browsers (non TaskHandoff environments) ---
+
+function readLocalBrowserState() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(LOCAL_BROWSER_STATE_FILE, 'utf8'));
+    return (Array.isArray(parsed?.browsers) ? parsed.browsers : []).filter((item) => item?.pid && item?.endpoint);
+  } catch {
+    return [];
+  }
+}
+
+function writeLocalBrowserState(browsers) {
+  try {
+    if (!browsers.length) {
+      fs.rmSync(LOCAL_BROWSER_STATE_FILE, { force: true });
+      return;
+    }
+    fs.mkdirSync(path.dirname(LOCAL_BROWSER_STATE_FILE), { recursive: true });
+    fs.writeFileSync(LOCAL_BROWSER_STATE_FILE, `${JSON.stringify({ browsers }, null, 2)}\n`);
+  } catch {
+    // State tracking is best-effort: a failed write only costs reuse metadata.
+  }
+}
+
+function processAlive(pid) {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+async function liveLocalBrowsers({ prune = true } = {}) {
+  const tracked = readLocalBrowserState();
+  const live = [];
+  for (const entry of tracked) {
+    if (processAlive(Number(entry.pid)) && (await probeCdp(entry.endpoint))) live.push(entry);
+  }
+  if (prune && live.length !== tracked.length) writeLocalBrowserState(live);
+  return live;
+}
+
+function findOnPath(name) {
+  const dirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  const names = process.platform === 'win32' && !/\.[a-z0-9]+$/i.test(name) ? [`${name}.exe`, name] : [name];
+  for (const dir of dirs) {
+    for (const candidate of names) {
+      const full = path.join(dir, candidate);
+      try {
+        if (fs.existsSync(full) && fs.statSync(full).isFile()) return full;
+      } catch {
+        // ignore unreadable PATH entries
+      }
+    }
+  }
+  return null;
+}
+
+function browserExecutableCandidates() {
+  const home = os.homedir();
+  if (process.platform === 'darwin') {
+    return [
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
+      '/Applications/Chromium.app/Contents/MacOS/Chromium',
+      '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+      '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+      '/Applications/Vivaldi.app/Contents/MacOS/Vivaldi',
+      path.join(home, 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
+      path.join(home, 'Applications/Chromium.app/Contents/MacOS/Chromium')
+    ];
+  }
+  if (process.platform === 'win32') {
+    const programFiles = process.env['ProgramFiles'] || 'C:\\Program Files';
+    const programFilesX86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+    const localAppData = process.env.LOCALAPPDATA || '';
+    return [
+      path.join(programFiles, 'Google\\Chrome\\Application\\chrome.exe'),
+      path.join(programFilesX86, 'Google\\Chrome\\Application\\chrome.exe'),
+      localAppData ? path.join(localAppData, 'Google\\Chrome\\Application\\chrome.exe') : null,
+      path.join(programFiles, 'Microsoft\\Edge\\Application\\msedge.exe'),
+      path.join(programFilesX86, 'Microsoft\\Edge\\Application\\msedge.exe'),
+      path.join(programFiles, 'BraveSoftware\\Brave-Browser\\Application\\brave.exe'),
+      localAppData ? path.join(localAppData, 'Chromium\\Application\\chrome.exe') : null
+    ].filter(Boolean);
+  }
+  return ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser', 'microsoft-edge', 'microsoft-edge-stable', 'brave-browser', 'vivaldi'];
+}
+
+async function playwrightChromiumPath() {
+  try {
+    const { chromium } = await loadPlaywright();
+    const candidate = chromium.executablePath();
+    return candidate && fs.existsSync(candidate) ? candidate : null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveBrowserExecutable(flags) {
+  const explicit = flags.executable ? String(flags.executable) : (process.env.BCAP_BROWSER || process.env.BCAP_CHROME || null);
+  if (explicit) {
+    const resolved = fs.existsSync(explicit) ? explicit : findOnPath(explicit);
+    if (!resolved) throw new Error(`browser executable not found: ${explicit}`);
+    return resolved;
+  }
+  for (const candidate of browserExecutableCandidates()) {
+    const resolved = path.isAbsolute(candidate) ? candidate : findOnPath(candidate);
+    if (resolved && fs.existsSync(resolved)) return resolved;
+  }
+  const bundled = await playwrightChromiumPath();
+  if (bundled) return bundled;
+  throw new Error('no local Chrome/Chromium executable found. Install one or pass --executable <path> / BCAP_BROWSER=<path>');
+}
+
+function portFree(port) {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.once('error', () => resolve(false));
+    server.once('listening', () => server.close(() => resolve(true)));
+    server.listen(port, '127.0.0.1');
+  });
+}
+
+async function pickLocalPort() {
+  const preferred = Number(process.env.BCAP_PORT) || 9222;
+  for (let port = preferred; port < preferred + 50; port += 1) {
+    if (await portFree(port)) return port;
+  }
+  throw new Error(`no free CDP port in ${preferred}-${preferred + 49}`);
+}
+
+async function launchLocalBrowser(flags, env) {
+  // Headless is opt-in: the default is a visible browser window.
+  const headlessEnv = (process.env.BCAP_HEADLESS || '').toLowerCase();
+  const headless = Boolean(flags.headless) || ['1', 'true', 'yes', 'on'].includes(headlessEnv);
+  const wantNew = Boolean(flags['new-session']);
+  const explicit = flags.cdp ? normalizeEndpoint(String(flags.cdp)) : (process.env.BCAP_CDP ? normalizeEndpoint(process.env.BCAP_CDP) : null);
+  if (!wantNew) {
+    const reuse = (await liveLocalBrowsers())[0] ?? null;
+    if (reuse) {
+      const version = await httpJson(`${reuse.endpoint}/json/version`).catch(() => null);
+      print({ ok: true, environment: env.mode, reason: env.reason, endpoint: reuse.endpoint, launched: false, reused: true, sessionId: reuse.id, pid: Number(reuse.pid), browser: version?.Browser ?? null, headless: Boolean(reuse.headless) });
+      return;
+    }
+  }
+  const candidates = [...new Set([explicit, ...(wantNew ? [] : CDP_CANDIDATES)])].filter(Boolean);
+  for (const candidate of candidates) {
+    if (!(await probeCdp(candidate))) continue;
+    const endpoint = normalizeEndpoint(candidate);
+    const version = await httpJson(`${endpoint}/json/version`).catch(() => null);
+    print({ ok: true, environment: env.mode, reason: env.reason, endpoint, launched: false, reused: true, external: true, sessionId: null, browser: version?.Browser ?? null });
+    return;
+  }
+  if (explicit) throw new Error(`no CDP endpoint at ${explicit}; drop --cdp/BCAP_CDP to launch a local browser instead`);
+  const port = await pickLocalPort();
+  const endpoint = `http://127.0.0.1:${port}`;
+  const executable = await resolveBrowserExecutable(flags);
+  const requestedProfile = path.resolve(process.cwd(), flags['user-data-dir'] ? String(flags['user-data-dir']) : LOCAL_PROFILE_DIR);
+  // A Chrome instance already owning this profile would swallow the new flags,
+  // so a second browser gets its own profile directory.
+  const profileInUse = (await liveLocalBrowsers()).some((item) => item.userDataDir === requestedProfile);
+  const userDataDir = profileInUse ? `${requestedProfile}-${port}` : requestedProfile;
+  fs.mkdirSync(userDataDir, { recursive: true });
+  const args = [
+    `--remote-debugging-port=${port}`,
+    '--remote-debugging-address=127.0.0.1',
+    '--remote-allow-origins=*',
+    `--user-data-dir=${userDataDir}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-background-networking',
+    '--disable-sync',
+    '--disable-translate',
+    '--hide-crash-restore-bubble',
+    '--window-size=1280,900'
+  ];
+  if (headless) args.push('--headless=new');
+  if (process.env.BCAP_NO_SANDBOX === '1') args.push('--no-sandbox');
+  const child = spawn(executable, [...args, flags.url ? String(flags.url) : 'about:blank'], { detached: true, stdio: 'ignore' });
+  child.unref();
+  let ready = false;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    if (await probeCdp(endpoint)) { ready = true; break; }
+    if (child.exitCode !== null || child.killed) break;
+    await sleep(500);
+  }
+  if (!ready) {
+    try { process.kill(Number(child.pid), 'SIGKILL'); } catch { /* already gone */ }
+    throw new Error(`local browser started but CDP ${endpoint} did not become ready (executable: ${executable})`);
+  }
+  const version = await httpJson(`${endpoint}/json/version`).catch(() => null);
+  const entry = { id: `local-${child.pid}`, pid: Number(child.pid), port, endpoint, executable, userDataDir, headless, startedAt: new Date().toISOString() };
+  writeLocalBrowserState([...(await liveLocalBrowsers()), entry]);
+  print({ ok: true, environment: env.mode, reason: env.reason, endpoint, launched: true, reused: false, sessionId: entry.id, pid: entry.pid, executable, userDataDir, headless, browser: version?.Browser ?? null });
+}
+
+async function stopLocalBrowser(entry) {
+  writeLocalBrowserState((await liveLocalBrowsers()).filter((item) => item.id !== entry.id));
+  const pid = Number(entry.pid);
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch (error) {
+    if (error?.code !== 'ESRCH') throw error;
+  }
+  for (let attempt = 0; attempt < 20 && processAlive(pid); attempt += 1) await sleep(250);
+  if (processAlive(pid)) {
+    try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+  }
+  print({ ok: true, environment: 'local', sessionId: entry.id, pid, endpoint: entry.endpoint, stopped: true });
+}
+
 async function listManagedChromiums(api) {
-  const state = await httpJson(`${api}/api/apps/sessions/state`);
-  const sessions = (state?.data?.snapshot?.sessions ?? []).filter((item) => item.appId === 'chromium' && item.status === 'running');
+  const all = await controlPlaneSessions(api);
+  const sessions = all.filter((item) => item.appId === 'chromium' && item.status === 'running');
   const result = [];
   for (const session of sessions) {
     let endpoint = session.automation?.endpoint ? normalizeEndpoint(session.automation.endpoint) : null;
@@ -108,20 +373,27 @@ async function listManagedChromiums(api) {
 
 async function resolveTarget(flags) {
   const api = flags.api ? String(flags.api) : DEFAULT_API;
-  if (flags.cdp) return { endpoint: normalizeEndpoint(flags.cdp), sessionId: null };
-  const sessions = await listManagedChromiums(api).catch(() => []);
+  const env = await detectEnvironment(api);
+  if (flags.cdp) return { endpoint: normalizeEndpoint(flags.cdp), sessionId: null, env };
+  const local = await liveLocalBrowsers();
   if (flags.session) {
     const wanted = String(flags.session);
-    const hit = sessions.find((item) => item.sessionId === wanted);
+    const localHit = local.find((item) => item.id === wanted || String(item.pid) === wanted || String(item.port) === wanted);
+    if (localHit) return { endpoint: localHit.endpoint, sessionId: localHit.id, env };
+    const hit = (await listManagedChromiums(api).catch(() => [])).find((item) => item.sessionId === wanted);
     if (!hit) throw new Error(`No running browser session with id ${wanted}. Run "status" to list sessions.`);
-    return { endpoint: hit.endpoint, sessionId: hit.sessionId };
+    return { endpoint: hit.endpoint, sessionId: hit.sessionId, env };
   }
-  if (process.env.BCAP_CDP) return { endpoint: normalizeEndpoint(process.env.BCAP_CDP), sessionId: null };
-  if (sessions.length && (await probeCdp(sessions[0].endpoint))) return { endpoint: sessions[0].endpoint, sessionId: sessions[0].sessionId };
-  for (const candidate of DEFAULT_CDP_CANDIDATES) {
-    if (candidate && (await probeCdp(candidate))) return { endpoint: normalizeEndpoint(candidate), sessionId: null };
+  if (env.mode === 'taskhandoff') {
+    const sessions = await listManagedChromiums(api).catch(() => []);
+    if (sessions.length && (await probeCdp(sessions[0].endpoint))) return { endpoint: sessions[0].endpoint, sessionId: sessions[0].sessionId, env };
   }
-  throw new Error('No running browser CDP endpoint found. Start it with: node scripts/bcap.mjs launch');
+  if (process.env.BCAP_CDP) return { endpoint: normalizeEndpoint(process.env.BCAP_CDP), sessionId: null, env };
+  if (local.length && (await probeCdp(local[0].endpoint))) return { endpoint: local[0].endpoint, sessionId: local[0].id, env };
+  for (const candidate of CDP_CANDIDATES) {
+    if (candidate && (await probeCdp(candidate))) return { endpoint: normalizeEndpoint(candidate), sessionId: null, env };
+  }
+  throw new Error(`No running browser CDP endpoint found (environment: ${env.mode}, ${env.reason}). Start it with: node scripts/bcap.mjs launch`);
 }
 
 async function connect(endpoint) {
@@ -656,28 +928,35 @@ function urlPatternMatches(pattern, url) {
 
 async function cmdStatus(flags) {
   const api = flags.api ? String(flags.api) : DEFAULT_API;
-  const sessions = await listManagedChromiums(api).catch(() => []);
+  const env = await detectEnvironment(api);
+  const local = await liveLocalBrowsers();
+  const sessions = env.mode === 'taskhandoff' ? await listManagedChromiums(api).catch(() => []) : [];
   let endpoint = null;
   let selectedSessionId = null;
   if (flags.cdp) {
     endpoint = normalizeEndpoint(flags.cdp);
   } else if (flags.session) {
-    const hit = sessions.find((item) => item.sessionId === String(flags.session));
+    const wanted = String(flags.session);
+    const localHit = local.find((item) => item.id === wanted || String(item.pid) === wanted || String(item.port) === wanted);
+    const hit = localHit ?? sessions.find((item) => item.sessionId === wanted);
     if (!hit) throw new Error(`No running browser session with id ${flags.session}.`);
     endpoint = hit.endpoint;
-    selectedSessionId = hit.sessionId;
+    selectedSessionId = localHit ? localHit.id : hit.sessionId;
   } else if (process.env.BCAP_CDP) {
     endpoint = normalizeEndpoint(process.env.BCAP_CDP);
+  } else if (local.length) {
+    endpoint = local[0].endpoint;
+    selectedSessionId = local[0].id;
   } else if (sessions.length) {
     endpoint = sessions[0].endpoint;
     selectedSessionId = sessions[0].sessionId;
   } else {
-    for (const candidate of DEFAULT_CDP_CANDIDATES) {
+    for (const candidate of CDP_CANDIDATES) {
       if (candidate && (await probeCdp(candidate))) { endpoint = normalizeEndpoint(candidate); break; }
     }
   }
   if (!endpoint || !(await probeCdp(endpoint))) {
-    throw new Error('Browser is not running. Start it with: node scripts/bcap.mjs launch');
+    throw new Error(`Browser is not running (environment: ${env.mode}, ${env.reason}). Start it with: node scripts/bcap.mjs launch`);
   }
   const version = await httpJson(`${endpoint}/json/version`);
   const tabs = (await httpJson(`${endpoint}/json/list`))
@@ -685,9 +964,11 @@ async function cmdStatus(flags) {
     .map((item) => ({ id: item.id, title: item.title, url: item.url }));
   print({
     ok: true,
+    environment: { mode: env.mode, reason: env.reason },
     endpoint,
     sessionId: selectedSessionId,
     sessions: sessions.map((item) => ({ sessionId: item.sessionId, endpoint: item.endpoint, default: item.sessionId === selectedSessionId })),
+    localBrowsers: local.map((item) => ({ id: item.id, pid: Number(item.pid), endpoint: item.endpoint, executable: item.executable, headless: Boolean(item.headless), default: item.id === selectedSessionId })),
     browser: version.Browser,
     tabCount: tabs.length,
     tabs
@@ -696,6 +977,11 @@ async function cmdStatus(flags) {
 
 async function cmdLaunch(flags) {
   const api = flags.api ? String(flags.api) : DEFAULT_API;
+  const env = await detectEnvironment(api);
+  if (env.mode === 'local') {
+    await launchLocalBrowser(flags, env);
+    return;
+  }
   let session = flags['new-session'] ? null : ((await listManagedChromiums(api).catch(() => []))[0] ?? null);
   if (!session) {
     const response = await fetch(`${api}/api/apps/sessions`, {
@@ -703,7 +989,8 @@ async function cmdLaunch(flags) {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ appId: 'chromium' }),
       signal: AbortSignal.timeout(30000)
-    });
+    }).catch(() => null);
+    if (!response) throw new Error(`cannot reach the TaskHandoff control plane at ${api} to launch a Chromium session (use --env local to launch a local browser instead)`);
     const body = await response.json().catch(() => null);
     if (!response.ok) throw new Error(body?.error?.message || `launch failed (HTTP ${response.status})`);
     const automation = body?.data?.automation ?? {};
@@ -717,17 +1004,34 @@ async function cmdLaunch(flags) {
   }
   if (!(await probeCdp(session.endpoint))) throw new Error(`CDP endpoint ${session.endpoint} did not become ready`);
   const version = await httpJson(`${session.endpoint}/json/version`);
-  print({ ok: true, sessionId: session.sessionId, endpoint: session.endpoint, browser: version.Browser });
+  print({ ok: true, environment: env.mode, reason: env.reason, sessionId: session.sessionId, endpoint: session.endpoint, launched: !flags['new-session'], browser: version.Browser });
 }
 
 async function cmdStop(flags, positional) {
-  const sessionId = positional[0] ?? (flags.session ? String(flags.session) : null);
-  if (!sessionId) throw new Error('usage: bcap stop <sessionId> (or --session <id>)');
   const api = flags.api ? String(flags.api) : DEFAULT_API;
-  const response = await fetch(`${api}/api/apps/sessions/${sessionId}/stop`, { method: 'POST', signal: AbortSignal.timeout(15000) });
+  const env = await detectEnvironment(api);
+  let sessionId = positional[0] ?? (flags.session ? String(flags.session) : null);
+  if (sessionId === 'all') {
+    const all = await liveLocalBrowsers();
+    if (!all.length) throw new Error('no local browser started by bcap is running');
+    for (const entry of all) await stopLocalBrowser(entry);
+    return;
+  }
+  if (!sessionId && env.mode === 'local') {
+    const all = await liveLocalBrowsers();
+    if (all.length === 1) { await stopLocalBrowser(all[0]); return; }
+    if (!all.length) throw new Error('no local browser started by bcap is running');
+    throw new Error(`multiple local browsers running; pass one of: ${all.map((item) => item.id).join(', ')}, or "all"`);
+  }
+  if (!sessionId) throw new Error('usage: bcap stop <sessionId> (or --session <id>)');
+  const localHit = (await liveLocalBrowsers()).find((item) => item.id === sessionId || String(item.pid) === sessionId || String(item.port) === sessionId);
+  if (localHit) { await stopLocalBrowser(localHit); return; }
+  if (env.mode === 'local') throw new Error(`no running browser matches "${sessionId}" (environment: local). Run "status" to list browsers or "stop all".`);
+  const response = await fetch(`${api}/api/apps/sessions/${sessionId}/stop`, { method: 'POST', signal: AbortSignal.timeout(15000) }).catch(() => null);
+  if (!response) throw new Error(`cannot reach the TaskHandoff control plane at ${api} to stop "${sessionId}" (use --env local for a locally launched browser)`);
   const body = await response.json().catch(() => null);
   if (!response.ok) throw new Error(body?.error?.message || `stop failed (HTTP ${response.status})`);
-  print({ ok: true, sessionId, status: body?.data?.status ?? 'stopping' });
+  print({ ok: true, environment: env.mode, sessionId, status: body?.data?.status ?? 'stopping' });
 }
 
 async function cmdList(flags) {
@@ -1160,8 +1464,11 @@ Usage: node scripts/bcap.mjs <command> [options]
 
 Commands:
   status                 Show browser sessions, CDP endpoints and open tabs
-  launch                 Ensure a managed Chromium is running (--new-session to start another)
-  stop <sessionId>       Stop a managed browser session
+  launch                 Ensure a browser is running: TaskHandoff-managed Chromium, or a locally
+                         launched Chrome/Chromium with --remote-debugging-port. A visible window
+                         is the default (--headless is opt-in); also --new-session,
+                         --executable <path>, --user-data-dir <dir>, --port <n>
+  stop <sessionId|all>   Stop a managed session or a browser bcap launched locally
   list                   List open page tabs
   scripts                List reusable scripts under sites/ (--domain D, --match URL)
   run <script.js>        Run a reusable Node script (globals: page, context, browser, cdp, cap, input)
@@ -1213,7 +1520,9 @@ Common options:
   --input JSON     Input object passed to the script (run/exec)
   --input-file F   Read input JSON from a file ("-" reads stdin; cannot be combined with --script-file -)
   --cdp URL        Override the CDP endpoint (default: auto-discover, e.g. http://127.0.0.1:9201)
-  --api URL        TaskHandoff API base (default: ${DEFAULT_API})
+  --api URL        TaskHandoff control-plane base (default: ${DEFAULT_API})
+  --env <mode>     auto | taskhandoff | local (default auto, env BCAP_ENV): auto uses the TaskHandoff
+                   markers/control plane when present, otherwise the local browser
 `);
 }
 
@@ -1224,6 +1533,10 @@ async function main() {
     const format = String(flags.format);
     if (format !== 'compact' && format !== 'pretty') throw new Error('--format must be "compact" or "pretty"');
     outputFormat = format;
+  }
+  if (flags.env !== undefined) {
+    if (flags.env === true) throw new Error('--env needs a value: auto, taskhandoff or local');
+    envOverride = String(flags.env).toLowerCase();
   }
   const command = positional.shift();
   switch (command) {
