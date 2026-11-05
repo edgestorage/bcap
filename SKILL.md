@@ -1,171 +1,108 @@
 ---
 name: bcap
-description: Operate the local Chromium browser through Playwright and raw CDP - check or launch the browser, run reusable Node browser scripts, read/click/type on pages, extract data, take screenshots. Use for browser automation, web data extraction, site workflows, or any task needing a real browser tab.
+description: "Use a local Chromium over Playwright/CDP for browser-rendered or authenticated UI tasks: inspect pages, click/type, extract data, screenshot, and save reusable site scripts. Skip static HTTP fetches and source-only analysis."
 ---
 
 # bcap — local browser capability
 
-Self-contained skill folder: `SKILL.md` + `scripts/bcap.mjs` (Node CLI, Playwright + raw CDP) + `sites/` (reusable scripts) + `references/` (authoring guide). It drives whichever Chromium is available and detects the environment itself:
+Drive a local Chromium over CDP. The same CLI works inside a TaskHandoff instance (managed `chromium` app session) and on a plain machine (reuse an existing debug port or launch local Chrome/Chromium). Output is compact JSON unless `--pretty` is requested.
 
-- **TaskHandoff instance** (`TASK_HANDOFF_*` markers or a control plane answering on `http://127.0.0.1:8080`): drives the managed Chromium session, CDP auto-discovered (usually `http://127.0.0.1:9201`); the VNC view is visible in the instance UI.
-- **Any other environment** (plain machine, other agent runtime): reuses a Chromium that already has a debugging port open (`BCAP_CDP`, 9201, 9222, …) or launches the local Chrome/Chromium itself with `--remote-debugging-port`.
-
-`status` reports the detected environment; `--env taskhandoff|local` (or `BCAP_ENV`) forces it when detection is wrong.
-
-All commands run from the skill folder (the directory containing this `SKILL.md`; the development copy is `/workspace/bcap`):
+Run commands from this skill folder (the directory containing this `SKILL.md`):
 
 ```bash
-cd <skill-folder>   # e.g. ~/.codex/skills/bcap, ~/.config/opencode/skills/bcap or /workspace/bcap
+cd <skill-folder>
 node scripts/bcap.mjs help
 ```
 
-## Connection checks
-
-Before the first page automation step in a task, check the browser:
+## Start
 
 ```bash
-node scripts/bcap.mjs status   # browser sessions, CDP endpoints, open tabs
-node scripts/bcap.mjs launch   # no session running: start one and wait for CDP
+node scripts/bcap.mjs status   # environment, browser, sessions and tabs; may report running:false
+node scripts/bcap.mjs launch   # idempotent: reuse a reachable browser, otherwise start one
+node scripts/bcap.mjs list     # open page tabs and targetIds
 ```
 
-- No running session → `launch`, then re-check.
-- Multiple sessions running → target the matching one with `--session <id>`; do not guess when ambiguous — ask the user.
-- Target page not open → `nav` / `new`, or ask the user to open it.
+- `status` returning `running:false` is a normal check result; run `launch`, then check again.
+- More than one browser session and no clear target: ask the user rather than guessing; then pass `--session <id>`.
+- `--env taskhandoff|local` or `BCAP_ENV` forces the environment. Use `--env local` when TaskHandoff markers are present but no control plane is reachable and a local browser is the intended target.
+- Target tabs with `--url <substring>`, `--tab <targetId>`, `--new [url]`, or navigate before acting with `--nav <url>`.
 
-## Browser lifecycle
+Environment detection, managed/local browser lifecycle, multi-session handling and recovery are in `references/environments.md`.
 
-`launch` is idempotent in both environments: it reuses a browser that is already reachable and only starts one when needed.
+## Execution mode
 
-**TaskHandoff instance** — the browser is a managed app of the instance, so bcap never spawns a bare Chromium:
+- If the task can finish without a person touching the browser, prefer headless when bcap launches a local browser, using `launch --headless` or `BCAP_HEADLESS=1`. Automated login, tests, extraction and agent-performed visual checks via screenshots are unattended.
+- Use the visible browser only when the user must interact with, observe or take over the browser. This includes manual credentials/MFA or CAPTCHA, confirmation, payment, or an explicit request to watch. Override an inherited `BCAP_HEADLESS=1` with `BCAP_HEADLESS=0`.
+- `launch` reuses an existing browser. To switch an existing headless local session to visible, run `stop all` (or stop the relevant session), then launch again without headless. In a TaskHandoff instance, use the managed Chromium session and its visible KasmVNC view.
+- If the requested mode cannot be provided by the current browser, explain why and ask before stopping a user-controlled browser.
 
-- `launch` reuses a running `chromium` app session, or creates one via `POST /api/apps/sessions` (`appId: chromium`), waits until CDP is ready, and prints the endpoint.
-- Multiple browsers can run at once. `status` lists all sessions (the first running one is the default target); add `--session <id>` to target another, `launch --new-session` to start an additional session, and `stop <sessionId>` to end one.
-- The managed session exposes CDP at `http://127.0.0.1:9201` and a KasmVNC view in the instance Web UI, so the user can watch and interact with the same tabs.
-- API base defaults to `http://127.0.0.1:8080`; override with `--api <url>` or `BCAP_API`.
-- Tabs persist inside the session; it keeps running until stopped from the instance UI or `POST /api/apps/sessions/<id>/stop`.
+## Choose the lightest tool
 
-**Other environments** — bcap starts the local browser itself:
-
-- `launch` reuses a reachable CDP endpoint first (a browser the user or another tool already started, `--cdp` / `BCAP_CDP`, or the default ports 9201 / 9222), then otherwise spawns the local Chrome/Chromium with `--remote-debugging-port` on a free port.
-- Launch options: `--headless` (or `BCAP_HEADLESS=1`) — opt-in only, the default is a visible browser window, so pass it only on machines without a display; plus `--executable <path>` (or `BCAP_BROWSER`), `--user-data-dir <dir>` (default `<skill>/.state/browser-profile`, so logins persist), `--port <n>` (first port to try, default 9222, or `BCAP_PORT`), and `--new-session` to start an extra browser instead of reusing one.
-- Executable discovery order: `--executable` / `BCAP_BROWSER` → Chrome/Chromium/Edge/Brave/Vivaldi (macOS `/Applications`, Windows `Program Files`, Linux `PATH`) → Playwright's bundled Chromium. Nothing found fails with the exact path to set.
-- Launched browsers are tracked in `<skill>/.state/local-browser.json`; `status` lists them under `localBrowsers`, and `stop <local-id|pid|port>` (or `stop all`) ends them. Stale entries — dead pid or unreachable CDP — are pruned, and a browser that died is never reused.
-- `--cdp <url>` still points any command at an arbitrary Chromium with an open debugging port, regardless of the detected environment.
-
-If `status` reports no endpoint, run `launch` first — script/page commands fail fast with that hint otherwise.
-
-## Run scripts and reuse (core capability)
-
-Choose the lightest form that fits the task:
-
-- Tiny one-off reads (`document.title`, `location.href`, a short text fragment): `exec --script "..."` or `eval "..."`.
-- Non-trivial or repeated work: a script file — this is the reusable capability path.
+- Tiny page reads: `eval "<expression>"` for one expression, or `exec --script "..."` for a small DOM script.
+- Visible text, screenshots and tab management: `text`, `shot`, `list`, `nav`, `new`, `close`.
+- Trusted user input: `click <selector>`, `type <selector> <text>`, `press <key>`.
+- Raw browser protocol: `cdp <Domain.method> --params '<json>'`.
+- Non-trivial or repeated work: write a reusable script under `sites/<domain>/` and run it with `run`.
 
 ```bash
-node scripts/bcap.mjs scripts                                    # list the reusable script library
-node scripts/bcap.mjs scripts --domain github.com --match <url>  # filter by domain / by what can run there
+node scripts/bcap.mjs eval "document.title"
+node scripts/bcap.mjs exec --script "return { title: document.title, url: location.href }"
+node scripts/bcap.mjs text --limit 4000
+node scripts/bcap.mjs shot /tmp/page.png
+node scripts/bcap.mjs click 'button[type=submit]'
+node scripts/bcap.mjs type 'input[name=q]' 'hello world' --clear --delay 40
+node scripts/bcap.mjs press Enter --selector 'input[name=q]'
+node scripts/bcap.mjs cdp Browser.getVersion
+```
+
+## Work loop
+
+1. Check the browser and identify the tab the user is working in.
+2. Explore with `eval` / `exec` / `text`; avoid dumping full HTML or whole-page text.
+3. Act through the page's own UI, then verify the resulting URL, DOM, or success message.
+4. Check `scripts --domain <domain>` or `scripts --match <url>` before writing a repeated workflow; reuse or update the existing script.
+5. Keep a tab open only when it is the deliverable, needed for the next step, or awaiting user-only action. Close temporary tabs you opened.
+
+## Reusable scripts
+
+The script contract is ESM `export default async function (input) { ... }`. Globals: `page`, `context`, `browser`, `cdp`, `cap`, and `input`. Return structured JSON; do not `console.log`, because stdout carries the result.
+
+Save scripts to `sites/<domain>/<capability-name>.js`, include the machine-readable header, and document the domain in its `README.md`. Read `references/script-authoring.md` before writing or changing a script.
+
+```bash
+node scripts/bcap.mjs scripts --match https://example.com/
 node scripts/bcap.mjs run sites/examples/read-page-summary.js --new https://example.com --input '{"linkLimit":5}'
-echo '{"linkLimit":3}' | node scripts/bcap.mjs run sites/examples/read-page-summary.js --url example.com --input-file -
+node scripts/bcap.mjs run sites/<domain>/<capability>.js --url example.com --input-file input.json
 ```
-
-Reusable script contract:
-
-- ESM `export default async function (input) { ... }`; globals: `page` (Playwright Page), `context`, `browser`, `cdp` (page CDP session), `cap` (`{ page, context, browser, cdp, goto, click, type, press, sleep }`), `input`.
-- Return structured JSON (`{ ok, url, title, ... }`), not loose arrays or strings. Do not `console.log` — stdout carries the returned result.
-- Pass variable data through `--input '<json>'` / `--input-file <path>`; `--script-file -` and `--input-file -` read from stdin (stdin can only be consumed once — do not combine both).
-- Save reusable scripts to `sites/<domain>/<capability-name>.js` (domain = registrable domain, e.g. `github.com`, `docs.openai.com`).
-- Interact with `cap.click` / `cap.type` / `cap.press` (real input), not synthetic DOM events — see Real input below.
-
-Before writing a new script:
-
-1. Check the library first: `node scripts/bcap.mjs scripts --domain <domain>` (or `--match <url>`), then read `sites/<domain>/` and its `README.md` when present.
-2. Read `references/script-authoring.md` for the header format, naming, the domain README format, multi-page flows and worked examples.
-
-Tab selection for page commands: `--url <substr>` (reuse matching tab), `--tab <targetId>`, `--new [url]`, `--nav <url>` (navigate before acting); browser selection: `--session <id>`.
 
 ## Execution controls
 
-- `--timeout <ms>` bounds `run` and `exec` (default 30000, max 120000). On expiry the CLI prints `{ok:false, timedOut:true, error:"... timed out after Xms", url, title}` and exits 1 immediately; page actions the script already dispatched may still settle, so re-check page state before retrying.
-- `--evidence [sets]` records what happened during a `run`/`exec` and merges an `evidence` object into the result. Sets: `events` (navigation, console-error/warning, page-error, dialog, download, request-failed, new-tab), `dom` (visible-element diff with stable route keys, plus before/after timing), `common` (= events + dom), `all` (default when no value given). Use it to prove an action took effect and to debug flaky scripts. DOM lists default to 100 entries per list (`counts` and `omitted` are always exact; use `--evidence-limit all` for everything), and evidence briefly waits for the page to settle so async renders are captured.
-- `wait` blocks until a page condition is met instead of sleeping: `--until-selector <css>`, `--until-text <str>`, `--until-url <substr>`, `--url-change`; `--poll <ms>` (default 500), `--timeout <ms>` (default 120000). Exit code 1 on timeout.
-- `history [--limit N]` (default 20) lists recent executions with script, input, session, url/title, duration and error.
-
-## Real input (clicks, typing, keys)
-
-Drive the UI like a user: Playwright input is trusted by the page (`event.isTrusted === true`), while in-page `element.click()` / `dispatchEvent` is not and many sites ignore it (GitHub's file finder, for example). Prefer real input for anything that reacts to user gestures:
-
-```bash
-node scripts/bcap.mjs click 'button.submit'                          # real click
-node scripts/bcap.mjs type 'input[name=q]' 'hello world' --delay 40  # click, then real keystrokes
-node scripts/bcap.mjs type '#field' 'replace me' --clear             # clear the field first
-node scripts/bcap.mjs press Enter --selector 'input[name=q]'         # real key press on an element
-node scripts/bcap.mjs press 'Control+K'                              # key press on the focused element
-```
-
-Inside scripts use the same helpers on `cap` (`await cap.click(sel)`, `await cap.type(sel, text, { clear, delay })`, `await cap.press(key, { selector })`) or Playwright's own `page.getByRole(...).click()` / `page.keyboard.type(...)`. All three return `{ok, url, title, ...}` and accept `--timeout <ms>` for actionability waits.
+- `--timeout <ms>` bounds `run`, `exec`, `eval` and real-input actionability (default 30000; `wait` defaults to 120000; maximum 120000).
+- `--evidence [events|dom|common|all]` records navigation, console errors, failed requests and visible-element diffs around `run`/`exec`/input actions. Use it to prove an effect or diagnose flakiness.
+- `--evidence-limit <n|all>` caps each DOM list; counts and `omitted` remain exact.
+- `wait` blocks on a condition instead of sleeping: `--until-selector`, `--until-text`, `--until-url`, or `--url-change`.
+- `history --limit N` shows recent `run`/`exec` entries, including their inputs.
 
 ## Token economy
 
-stdout is compact single-line JSON by default; add `--pretty` (or `BCAP_FORMAT=pretty`) only when a human will read it. Keep results small:
+- stdout is compact single-line JSON by default; use `--pretty` only when a human will read it.
+- Request less with `--limit`, `--evidence events`, and `--evidence-limit`.
+- Return counts plus capped arrays (`itemCount`, `truncated`) from scripts instead of full collections or raw HTML.
+- Prefer role/text locators and event waits over fixed sleeps.
 
-- Ask for less: `--limit` on `text`/`history`, `--evidence events` when DOM diffs are not needed, and `--evidence-limit <n|all>` for DOM lists (default 100 per list; `counts` are exact and `omitted` reports what was cut).
-- DOM evidence entries omit empty fields (`id`, `text`, `rect`), so large diffs stay cheap.
-- In scripts, return counts plus capped arrays (`itemCount`, `truncated`) instead of dumping full page text or HTML; never echo raw HTML.
+## Operating rules
 
-## Playwright usage
+- Never place credentials or secrets in `--input`; execution history persists inputs. Let the user authenticate in the managed tab.
+- Prefer browser-visible UI actions over private or semi-private site APIs unless the user asks for API execution or the UI path is unavailable and the tradeoff is explained first.
+- For delete/send/pay/post or other destructive or externally visible actions, return a preview plan and wait for explicit confirmation before executing.
+- Pause for login, CAPTCHA, payment, approval, or permission problems and leave the tab open for the user.
+- Do not leave a human-in-the-loop task in a headless session where the user cannot take over.
+- Treat screenshots, page text and DOM evidence as potentially sensitive; return only what the task needs.
 
-Standard Playwright API; prefer role/text locators and event waits over fixed sleeps:
+Tab policy and state-changing actions are detailed in `references/safety.md`. Environment-specific behavior is in `references/environments.md`.
 
-```js
-export default async function (input) {
-  await page.locator('input[name="q"]').fill(input.query);
-  await page.getByRole('button', { name: 'Search' }).click();
-  await page.waitForLoadState('domcontentloaded');
-  const items = await page.locator('.result').allTextContents();
-  return { ok: true, url: page.url(), title: await page.title(), items };
-}
-```
+## References
 
-## Raw CDP
-
-- Inside scripts: `await cdp.send('Network.enable')`; browser-level session via `await browser.newBrowserCDPSession()`.
-- From the CLI:
-
-```bash
-node scripts/bcap.mjs cdp Browser.getVersion
-node scripts/bcap.mjs cdp Page.getFrameTree --url example.com
-node scripts/bcap.mjs cdp Page.captureScreenshot --params '{"format":"png"}' --url example.com
-```
-
-## One-off scripts
-
-`exec` runs DOM code inside the page (no Playwright API): a body with `return {...}`, or `export default async function (input) {...}`. `eval` evaluates a single expression. Both accept `--script-file <file|->` and stdin `-`.
-
-```bash
-node scripts/bcap.mjs exec --script "return { title: document.title, url: location.href }"
-node scripts/bcap.mjs eval "document.title"
-echo 'return { count: document.querySelectorAll("a").length }' | node scripts/bcap.mjs exec --script-file -
-```
-
-## Tab policy
-
-- Reuse the tab the user already has open for the task; do not close or repurpose the user's tabs without need.
-- Close only the temporary tabs you opened (lookup, navigation, verification) once their result is captured.
-- Keep a tab open when it is the deliverable, when the next step depends on it, or when it is waiting on a user-only action (login, captcha, payment, approval) for handoff.
-- If several tabs match, prefer the clear match; ask the user when it is ambiguous.
-- Keep at most 20 tabs overall (workspace rule); check `list` before opening new ones on busy tasks.
-
-## Stateful site actions
-
-For actions that change a user's account or site state (post, edit, delete, settings, subscriptions):
-
-- Prefer browser-visible UI operations: use the page's own buttons and inputs, then verify the resulting page state (success message, updated list, URL change).
-- Do not call a site's private or semi-private HTTP APIs directly, even from the same-origin page context, unless the user explicitly asks for API-based execution or the UI path is unavailable and the tradeoff is explained first.
-- Destructive or externally visible actions (delete/send/pay/post): return a preview plan first; execute only after explicit user confirmation or `input.confirm === true` when the user already approved.
-- Pause and ask the user on login, captcha, payment walls, or permission problems; leave that tab open for handoff (see Tab policy).
-
-## Notes
-
-- Legacy `.web-cap/*.js` scripts target the old in-page runtime (`document`/`location` globals, `cap.goto` re-run semantics). See the porting table in `references/script-authoring.md`.
-- bcap has no page-userscript concept: every script runs explicitly, nothing is auto-injected on page load.
-- Install/update into Codex skills: `bash install.sh` (add `--symlink` to link instead of copy).
+- `references/environments.md` — environment detection, TaskHandoff vs local browsers, lifecycle, recovery.
+- `references/script-authoring.md` — script headers, index, output conventions, multi-page flows, examples.
+- `references/safety.md` — tab ownership, state-changing actions, sensitive data.

@@ -34,7 +34,8 @@ install_one() {
   local name="$1" dest="$2"
   if [ "$mode" = "symlink" ]; then
     mkdir -p "$(dirname "$dest")"
-    ln -sfn "$skill_dir" "$dest"
+    rm -rf "$dest"
+    ln -s "$skill_dir" "$dest"
     echo "bcap installed for $name (symlink) -> $dest"
     return
   fi

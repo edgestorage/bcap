@@ -281,6 +281,12 @@ async function launchLocalBrowser(flags, env) {
   const headless = Boolean(flags.headless) || ['1', 'true', 'yes', 'on'].includes(headlessEnv);
   const wantNew = Boolean(flags['new-session']);
   const explicit = flags.cdp ? normalizeEndpoint(String(flags.cdp)) : (process.env.BCAP_CDP ? normalizeEndpoint(process.env.BCAP_CDP) : null);
+  if (explicit) {
+    if (!(await probeCdp(explicit))) throw new Error(`no CDP endpoint at ${explicit}; drop --cdp/BCAP_CDP to launch a local browser instead`);
+    const version = await httpJson(`${explicit}/json/version`).catch(() => null);
+    print({ ok: true, environment: env.mode, reason: env.reason, endpoint: explicit, launched: false, reused: true, external: true, sessionId: null, browser: version?.Browser ?? null });
+    return;
+  }
   if (!wantNew) {
     const reuse = (await liveLocalBrowsers())[0] ?? null;
     if (reuse) {
@@ -289,7 +295,7 @@ async function launchLocalBrowser(flags, env) {
       return;
     }
   }
-  const candidates = [...new Set([explicit, ...(wantNew ? [] : CDP_CANDIDATES)])].filter(Boolean);
+  const candidates = wantNew ? [] : [...new Set(CDP_CANDIDATES)].filter(Boolean);
   for (const candidate of candidates) {
     if (!(await probeCdp(candidate))) continue;
     const endpoint = normalizeEndpoint(candidate);
@@ -297,7 +303,6 @@ async function launchLocalBrowser(flags, env) {
     print({ ok: true, environment: env.mode, reason: env.reason, endpoint, launched: false, reused: true, external: true, sessionId: null, browser: version?.Browser ?? null });
     return;
   }
-  if (explicit) throw new Error(`no CDP endpoint at ${explicit}; drop --cdp/BCAP_CDP to launch a local browser instead`);
   const port = await pickLocalPort();
   const endpoint = `http://127.0.0.1:${port}`;
   const executable = await resolveBrowserExecutable(flags);
@@ -956,7 +961,21 @@ async function cmdStatus(flags) {
     }
   }
   if (!endpoint || !(await probeCdp(endpoint))) {
-    throw new Error(`Browser is not running (environment: ${env.mode}, ${env.reason}). Start it with: node scripts/bcap.mjs launch`);
+    if (flags.session) throw new Error(`No running browser session with id ${flags.session}.`);
+    print({
+      ok: true,
+      running: false,
+      environment: { mode: env.mode, reason: env.reason },
+      endpoint,
+      sessionId: selectedSessionId,
+      sessions: sessions.map((item) => ({ sessionId: item.sessionId, endpoint: item.endpoint, default: item.sessionId === selectedSessionId })),
+      localBrowsers: local.map((item) => ({ id: item.id, pid: Number(item.pid), endpoint: item.endpoint, executable: item.executable, headless: Boolean(item.headless), default: item.id === selectedSessionId })),
+      browser: null,
+      tabCount: 0,
+      tabs: [],
+      hint: 'No browser is reachable. Run: node scripts/bcap.mjs launch'
+    });
+    return;
   }
   const version = await httpJson(`${endpoint}/json/version`);
   const tabs = (await httpJson(`${endpoint}/json/list`))
@@ -964,6 +983,7 @@ async function cmdStatus(flags) {
     .map((item) => ({ id: item.id, title: item.title, url: item.url }));
   print({
     ok: true,
+    running: true,
     environment: { mode: env.mode, reason: env.reason },
     endpoint,
     sessionId: selectedSessionId,
@@ -983,6 +1003,7 @@ async function cmdLaunch(flags) {
     return;
   }
   let session = flags['new-session'] ? null : ((await listManagedChromiums(api).catch(() => []))[0] ?? null);
+  const launched = !session;
   if (!session) {
     const response = await fetch(`${api}/api/apps/sessions`, {
       method: 'POST',
@@ -1004,7 +1025,7 @@ async function cmdLaunch(flags) {
   }
   if (!(await probeCdp(session.endpoint))) throw new Error(`CDP endpoint ${session.endpoint} did not become ready`);
   const version = await httpJson(`${session.endpoint}/json/version`);
-  print({ ok: true, environment: env.mode, reason: env.reason, sessionId: session.sessionId, endpoint: session.endpoint, launched: !flags['new-session'], browser: version.Browser });
+  print({ ok: true, environment: env.mode, reason: env.reason, sessionId: session.sessionId, endpoint: session.endpoint, launched, reused: !launched, browser: version.Browser });
 }
 
 async function cmdStop(flags, positional) {
@@ -1230,9 +1251,11 @@ async function cmdExec(flags) {
 async function cmdEval(flags, positional) {
   const expression = positional.join(' ').trim();
   if (!expression) throw new Error('usage: bcap eval "<expression>"');
+  const timeoutMs = parseTimeout(flags);
   await withBrowser(flags, async ({ context }) => {
     const page = await selectPage(context, flags);
-    const result = await page.evaluate(expression);
+    if (flags.nav) await page.goto(String(flags.nav), { waitUntil: 'domcontentloaded' });
+    const result = await withTimeout(page.evaluate(expression), timeoutMs, 'eval expression');
     print(result === undefined ? null : result);
   });
 }
@@ -1466,7 +1489,9 @@ Commands:
   status                 Show browser sessions, CDP endpoints and open tabs
   launch                 Ensure a browser is running: TaskHandoff-managed Chromium, or a locally
                          launched Chrome/Chromium with --remote-debugging-port. A visible window
-                         is the default (--headless is opt-in); also --new-session,
+                         is the default; prefer --headless when no person needs to touch the
+                         browser, and keep it visible when the user must interact or watch.
+                         Also --new-session,
                          --executable <path>, --user-data-dir <dir>, --port <n>
   stop <sessionId|all>   Stop a managed session or a browser bcap launched locally
   list                   List open page tabs
