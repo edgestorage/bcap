@@ -15,7 +15,7 @@
 
 ```bash
 bash install.sh                     # 拷贝到 ~/.codex/skills/bcap
-bash install.sh --symlink           # 或软链到本目录
+bash install.sh --symlink           # 或软链到本目录（会替换已有目标）
 ```
 
 作为 OpenCode skill 安装（OpenCode 原生支持 Agent Skills，读取 `~/.config/opencode/skills/<name>/SKILL.md`）：
@@ -50,9 +50,11 @@ bcap 自己判断运行环境（`status` 输出 `environment.mode` 与判断依�
 默认 `auto`，可用 `--env taskhandoff|local` 或 `BCAP_ENV` 强制指定。
 
 ```bash
-node scripts/bcap.mjs status   # 环境、CDP 端点、浏览器版本、标签页、本地浏览器进程
+node scripts/bcap.mjs status   # 环境、CDP 端点、浏览器版本、标签页、本地浏览器进程；未启动时返回 running:false
 node scripts/bcap.mjs launch   # 幂等：可达就复用，没有才启动并等待 CDP 就绪
 ```
+
+完整的检测顺序、会话生命周期和故障恢复见 `references/environments.md`。
 
 任务实例模式：
 
@@ -65,14 +67,14 @@ node scripts/bcap.mjs launch   # 幂等：可达就复用，没有才启动并�
 其他环境（本地浏览器）：
 
 - `launch` 先复用可达的 CDP 端点（`--cdp` / `BCAP_CDP`，或默认端口 9201 / 9222），都没有才启动本地浏览器
-- 启动参数：默认**有界面**（非 headless，用户能看到并接管同一个窗口），只有显式 `--headless` 或 `BCAP_HEADLESS=1` 才无头启动（无显示器环境才需要）；另有 `--executable <path>`（或 `BCAP_BROWSER`）、`--user-data-dir <dir>`（默认 `<skill>/.state/browser-profile`，登录态可跨次复用）、`--port <n>`（起始端口，默认 9222，或 `BCAP_PORT`）、`--new-session` 再开一个而不是复用
+- 启动模式：默认**有界面**（非 headless，用户能看到并接管同一个窗口）。只要任务不需要用户碰浏览器，就优先用 `--headless` 或 `BCAP_HEADLESS=1`；自动登录、自动化测试、数据提取和基于截图的视觉检查都属于无人值守流程。只有用户必须亲自交互、观察或接管浏览器（例如手动输入凭据/MFA、确认、支付，或明确要求观看）时才保持有界面，不能用 headless（可用 `BCAP_HEADLESS=0` 覆盖继承的环境变量）。`launch` 会复用已有浏览器；需要把已有 headless 本地会话切换为有界面时，先停止该会话再重新 launch。另有 `--executable <path>`（或 `BCAP_BROWSER`）、`--user-data-dir <dir>`（默认 `<skill>/.state/browser-profile`，登录态可跨次复用）、`--port <n>`（起始端口，默认 9222，或 `BCAP_PORT`）、`--new-session` 再开一个而不是复用
 - 可执行文件查找顺序：`--executable` / `BCAP_BROWSER` → Chrome/Chromium/Edge/Brave/Vivaldi（macOS `/Applications`、Windows `Program Files`、Linux `PATH`）→ Playwright 自带 Chromium；都找不到时直接报错并提示设置路径
 - 启动的浏览器记录在 `<skill>/.state/local-browser.json`（gitignore），`status` 的 `localBrowsers` 会列出；`stop <id|pid|port>` 或 `stop all` 结束。进程已死或 CDP 不可达的记录自动清理，不会被复用
 
 ## 使用
 
 ```bash
-node scripts/bcap.mjs status     # 环境、端点、浏览器版本、标签页
+node scripts/bcap.mjs status     # 环境、端点、浏览器版本、标签页；未启动时返回 running:false
 node scripts/bcap.mjs launch     # 确保浏览器在运行（受管 Chromium 或本地 Chrome）
 node scripts/bcap.mjs launch --headless --executable '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 node scripts/bcap.mjs run sites/examples/read-page-summary.js --new https://example.com --input '{"linkLimit":5}'
@@ -80,19 +82,20 @@ node scripts/bcap.mjs scripts --match https://example.com/    # 脚本索引（-
 node scripts/bcap.mjs click 'input[name=q]'                     # 真实点击
 node scripts/bcap.mjs type 'input[name=q]' 'hello' --delay 40   # 真实键盘输入
 node scripts/bcap.mjs press Enter --selector 'input[name=q]'    # 真实按键
+node scripts/bcap.mjs eval "document.title"                     # 单表达式读取
 node scripts/bcap.mjs exec --script "return { title: document.title }" --evidence all
 node scripts/bcap.mjs wait --until-selector '#ready' --timeout 60000
 node scripts/bcap.mjs history --limit 10
 node scripts/bcap.mjs cdp Browser.getVersion
 ```
 
-完整命令、脚本约定与安全规则见 `SKILL.md`。
+完整命令与工作流见 `SKILL.md`；环境生命周期见 `references/environments.md`，脚本约定见 `references/script-authoring.md`，标签页与状态变更安全规则见 `references/safety.md`。
 
 ## 目录
 
 ```
-├── SKILL.md                    # skill 定义（name/description + 使用指南）
-├── references/                 # 脚本编写指南（reuse 规范、命名、域名 README、示例、旧脚本移植）
+├── SKILL.md                    # skill 入口（name/description + 工作流）
+├── references/                 # 环境生命周期、脚本编写指南、操作安全
 ├── scripts/bcap.mjs            # CLI 入口（status/launch/stop/scripts/run/exec/eval/click/type/press/wait/history/nav/new/close/shot/text/cdp）
 ├── sites/                      # 可复用站点脚本库（sites/<domain>/<capability-name>.js）
 │   └── examples/               # 示例脚本 + 域名 README 示例
